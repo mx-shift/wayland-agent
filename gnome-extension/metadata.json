@@ -1,0 +1,7 @@
+{
+    "uuid": "wayland-agent@mxshift.com",
+    "name": "wayland-agent helper",
+    "description": "Exposes window and monitor metadata to the wayland-agent daemon via the com.mxshift.WaylandAgent D-Bus interface. Lets unprivileged callers enumerate windows, focus a window, and read monitor layout/scale — data that GNOME's built-in org.gnome.Shell.Introspect API gates behind a hardcoded caller whitelist.",
+    "shell-version": ["45", "46", "47", "48", "49", "50"],
+    "url": "https://github.com/mxshift/wayland-agent"
+}
