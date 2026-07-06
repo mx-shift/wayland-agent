@@ -76,12 +76,21 @@ pub enum Request {
     KeyUp { name: String },
     /// Type a UTF-8 string by mapping each char to its keysym.
     Type { text: String },
-    /// Absolute pointer move on the given stream.
+    /// Absolute pointer move on the given stream.  `x`/`y` are in
+    /// screenshot-pixel space of that stream (what you read off the
+    /// PNG); the daemon scales them to the portal's logical space.
     Move { x: f64, y: f64, stream: usize },
     /// Press+release a pointer button at the current position.
     Click { button: String },
-    /// Move + press + release.
+    /// Move + press + release, in screenshot-pixel space of `stream`.
     ClickAt { x: f64, y: f64, button: String, stream: usize },
+    /// Absolute pointer move in **global logical** coords (the space
+    /// the extension reports window/monitor rects in).  The daemon
+    /// resolves which stream covers the point and subtracts its origin;
+    /// no scaling is applied (global coords are already logical).
+    MoveGlobal { x: f64, y: f64 },
+    /// Move (global logical coords) + press + release.
+    ClickAtGlobal { x: f64, y: f64, button: String },
     /// Capture one frame per stream. Writes PNGs to the supplied
     /// path (suffixed when there are multiple streams).
     Screenshot { out: PathBuf },
@@ -132,11 +141,49 @@ impl Response {
 /// the screencast portal's Stream metadata when the source is a
 /// monitor (they describe the monitor's rect in global screen coords);
 /// for Window sources the portal omits them and they stay None.
+///
+/// Coordinate spaces — the whole reason clicks used to miss:
+/// - `position`/`size` are **logical** global coords (mutter's layout,
+///   the same space the gnome-shell extension reports window rects in).
+/// - `frame_size` is the **physical** pixel size of the PipeWire frame
+///   we actually capture (learned on the first `screenshot`).  On a
+///   HiDPI/fractional monitor it is `size * monitor_scale`, so a
+///   screenshot PNG is bigger than the logical `size`.
+/// - The RemoteDesktop portal's `NotifyPointerMotionAbsolute` wants
+///   coordinates in the stream's **logical** space (i.e. `size`).
+///
+/// So a pixel read off a screenshot (physical space) must be scaled by
+/// `size / frame_size` before it is a valid pointer coordinate.  That
+/// ratio is the "multiplier" callers kept reinventing; the daemon now
+/// applies it internally (see `screenshot_to_input`) so every command
+/// takes plain screenshot-pixel coordinates.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StreamInfo {
     pub node_id: u32,
     pub position: Option<(i32, i32)>,
     pub size: Option<(i32, i32)>,
+    /// Physical size of the captured PipeWire frame, learned lazily on
+    /// the first `screenshot`.  None until then (falls back to a 1:1
+    /// ratio, which is correct on unscaled monitors).
+    pub frame_size: Option<(u32, u32)>,
+}
+
+impl StreamInfo {
+    /// Convert a screenshot-pixel coordinate (physical space, what a
+    /// caller reads off the PNG) into the logical pointer coordinate the
+    /// RemoteDesktop portal expects.  Uses the cached `frame_size`
+    /// (physical) vs `size` (logical) ratio; if either is unknown the
+    /// conversion is 1:1 — correct for unscaled monitors, and the only
+    /// case where a pre-screenshot click on a scaled monitor could still
+    /// be off (take a screenshot first to prime the ratio).
+    pub fn screenshot_to_input(&self, x: f64, y: f64) -> (f64, f64) {
+        match (self.size, self.frame_size) {
+            (Some((lw, lh)), Some((fw, fh))) if fw > 0 && fh > 0 => {
+                (x * lw as f64 / fw as f64, y * lh as f64 / fh as f64)
+            }
+            _ => (x, y),
+        }
+    }
 }
 
 impl StreamInfo {
@@ -153,6 +200,20 @@ impl StreamInfo {
             _ => false,
         }
     }
+}
+
+/// Resolve a global logical coordinate to (node_id, local_x, local_y).
+/// Finds the stream whose logical rect covers (x, y) and subtracts its
+/// origin.  Global coords are already logical, so no scaling — this is
+/// the path for coordinates that come from the gnome-shell extension
+/// (`windows`/`find-window`/`monitors`), not from a screenshot.
+fn resolve_global(streams: &[StreamInfo], x: f64, y: f64) -> Result<(u32, f64, f64)> {
+    let s = streams
+        .iter()
+        .find(|s| s.contains(x, y))
+        .ok_or_else(|| anyhow!("no stream covers global point ({x}, {y})"))?;
+    let (px, py) = s.position.ok_or_else(|| anyhow!("stream has no position"))?;
+    Ok((s.node_id, x - px as f64, y - py as f64))
 }
 
 /// Shared state held across socket connections. Wrapped in a Mutex so
@@ -228,6 +289,7 @@ async fn establish_session() -> Result<(
             node_id: s.pipe_wire_node_id(),
             position: s.position(),
             size: s.size(),
+            frame_size: None,
         })
         .collect();
     if streams.is_empty() {
@@ -330,8 +392,8 @@ async fn handle_client(stream: UnixStream, state: Arc<Mutex<DaemonState>>) -> Re
     Ok(())
 }
 
-async fn dispatch(state: Arc<Mutex<DaemonState>>, req: Request) -> Result<Response> {
-    let state = state.lock().await;
+async fn dispatch(state_arc: Arc<Mutex<DaemonState>>, req: Request) -> Result<Response> {
+    let state = state_arc.lock().await;
     match req {
         Request::Ping => Ok(Response::ok_detail("pong".into())),
         Request::Streams => {
@@ -469,11 +531,20 @@ async fn dispatch(state: Arc<Mutex<DaemonState>>, req: Request) -> Result<Respon
             Ok(Response::ok())
         }
         Request::Move { x, y, stream } => {
-            let node = state.streams.get(stream)
-                .ok_or_else(|| anyhow!("stream {stream} out of range"))?
-                .node_id;
+            let s = state.streams.get(stream)
+                .ok_or_else(|| anyhow!("stream {stream} out of range"))?;
+            let node = s.node_id;
+            let (ix, iy) = s.screenshot_to_input(x, y);
             state.rd.notify_pointer_motion_absolute(
-                &state.session, node, x, y,
+                &state.session, node, ix, iy,
+                NotifyPointerMotionAbsoluteOptions::default(),
+            ).await?;
+            Ok(Response::ok())
+        }
+        Request::MoveGlobal { x, y } => {
+            let (node, lx, ly) = resolve_global(&state.streams, x, y)?;
+            state.rd.notify_pointer_motion_absolute(
+                &state.session, node, lx, ly,
                 NotifyPointerMotionAbsoluteOptions::default(),
             ).await?;
             Ok(Response::ok())
@@ -491,12 +562,30 @@ async fn dispatch(state: Arc<Mutex<DaemonState>>, req: Request) -> Result<Respon
             Ok(Response::ok())
         }
         Request::ClickAt { x, y, button, stream } => {
-            let node = state.streams.get(stream)
-                .ok_or_else(|| anyhow!("stream {stream} out of range"))?
-                .node_id;
+            let s = state.streams.get(stream)
+                .ok_or_else(|| anyhow!("stream {stream} out of range"))?;
+            let node = s.node_id;
+            let (ix, iy) = s.screenshot_to_input(x, y);
             let code = crate::button_code(&button)?;
             state.rd.notify_pointer_motion_absolute(
-                &state.session, node, x, y,
+                &state.session, node, ix, iy,
+                NotifyPointerMotionAbsoluteOptions::default(),
+            ).await?;
+            state.rd.notify_pointer_button(
+                &state.session, code, KeyState::Pressed,
+                NotifyPointerButtonOptions::default(),
+            ).await?;
+            state.rd.notify_pointer_button(
+                &state.session, code, KeyState::Released,
+                NotifyPointerButtonOptions::default(),
+            ).await?;
+            Ok(Response::ok())
+        }
+        Request::ClickAtGlobal { x, y, button } => {
+            let (node, lx, ly) = resolve_global(&state.streams, x, y)?;
+            let code = crate::button_code(&button)?;
+            state.rd.notify_pointer_motion_absolute(
+                &state.session, node, lx, ly,
                 NotifyPointerMotionAbsoluteOptions::default(),
             ).await?;
             state.rd.notify_pointer_button(
@@ -530,12 +619,24 @@ async fn dispatch(state: Arc<Mutex<DaemonState>>, req: Request) -> Result<Respon
             drop(state);
 
             let outs_clone = outs.clone();
-            tokio::task::spawn_blocking(move || {
+            let dims = tokio::task::spawn_blocking(move || {
                 let refs: Vec<&std::path::Path> = outs_clone.iter().map(|p| p.as_path()).collect();
                 crate::pipewire_capture_frames_pub(fd_dup, &node_ids, &refs)
             })
             .await
             .context("screenshot blocking task")??;
+
+            // Cache the physical frame size per stream so subsequent
+            // clicks can scale screenshot pixels into logical pointer
+            // coords (see StreamInfo::screenshot_to_input).
+            {
+                let mut st = state_arc.lock().await;
+                for (i, dim) in dims.iter().enumerate() {
+                    if let Some(s) = st.streams.get_mut(i) {
+                        s.frame_size = Some(*dim);
+                    }
+                }
+            }
 
             Ok(Response::ok_paths(outs))
         }

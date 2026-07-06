@@ -91,12 +91,21 @@ enum Cmd {
     /* ----- [portal]  pointer ----- */
 
     /// [portal] Move the pointer to (x, y) on the picked stream.
+    /// Coordinates are screenshot pixels of that stream (0..W × 0..H of
+    /// its PNG); the daemon scales them to the portal's logical space,
+    /// so they match 1:1 with what you read off a `screenshot`.
     Move {
         x: f64,
         y: f64,
         #[arg(long, default_value_t = 0)]
         stream: usize,
     },
+
+    /// [portal] Move the pointer to a GLOBAL logical coordinate — the
+    /// space the extension's `windows`/`monitors` report rects in. The
+    /// daemon picks the covering stream and subtracts its origin for
+    /// you; no manual offset math, no scaling.
+    MoveGlobal { x: f64, y: f64 },
 
     /// [portal] Press+release a pointer button at the current
     /// position.
@@ -106,8 +115,9 @@ enum Cmd {
     },
 
     /// [portal] Move pointer to (x, y) on the picked stream, then
-    /// click.  Useful for focusing a window before chaining
-    /// `key`/`type`.
+    /// click.  Coordinates are screenshot pixels of that stream (same
+    /// space as `screenshot` output).  Useful for focusing a window
+    /// before chaining `key`/`type`.
     ClickAt {
         x: f64,
         y: f64,
@@ -115,6 +125,17 @@ enum Cmd {
         button: String,
         #[arg(long, default_value_t = 0)]
         stream: usize,
+    },
+
+    /// [portal] Click at a GLOBAL logical coordinate — feed it
+    /// `frame_x`/`frame_y` (or a point inside `client_rect`) straight
+    /// from the extension's `find-window`/`windows` output.  The daemon
+    /// resolves the stream and offset itself.
+    ClickGlobal {
+        x: f64,
+        y: f64,
+        #[arg(long, default_value = "left")]
+        button: String,
     },
 
     /* ----- [portal]  capture ----- */
@@ -175,26 +196,30 @@ pub(crate) fn button_code(name: &str) -> Result<i32> {
 /// per node, write each as PNG to the matching output path. Runs
 /// synchronously on its own thread (PipeWire's main loop is blocking
 /// and not Tokio-compatible).
+/// Returns the physical (width, height) of each captured frame, in the
+/// same order as `node_ids`.  The daemon caches these so it can scale
+/// screenshot-pixel click coordinates into the portal's logical space.
 pub(crate) fn pipewire_capture_frames_pub(
     fd: OwnedFd,
     node_ids: &[u32],
     outs: &[&Path],
-) -> Result<()> {
+) -> Result<Vec<(u32, u32)>> {
     pipewire_capture_frames(fd, node_ids, outs)
 }
 
-fn pipewire_capture_frames(fd: OwnedFd, node_ids: &[u32], outs: &[&Path]) -> Result<()> {
+fn pipewire_capture_frames(fd: OwnedFd, node_ids: &[u32], outs: &[&Path]) -> Result<Vec<(u32, u32)>> {
     assert_eq!(node_ids.len(), outs.len(), "node_ids/outs length mismatch");
     // For single-stream we delegate to the original single-frame
     // path to keep the well-tested code working unchanged. Multi-
     // stream uses a fanout below.
     if node_ids.len() == 1 {
-        return pipewire_capture_one_frame_inner(fd, node_ids[0], outs[0]);
+        let dim = pipewire_capture_one_frame_inner(fd, node_ids[0], outs[0])?;
+        return Ok(vec![dim]);
     }
     pipewire_capture_many_inner(fd, node_ids, outs)
 }
 
-fn pipewire_capture_one_frame_inner(fd: OwnedFd, node_id: u32, out: &Path) -> Result<()> {
+fn pipewire_capture_one_frame_inner(fd: OwnedFd, node_id: u32, out: &Path) -> Result<(u32, u32)> {
     use pipewire as pw;
     use pw::spa;
     use spa::pod::Pod;
@@ -384,7 +409,7 @@ fn pipewire_capture_one_frame_inner(fd: OwnedFd, node_id: u32, out: &Path) -> Re
     let img = image::RgbaImage::from_raw(w, h, rgba)
         .ok_or_else(|| anyhow!("frame buffer length doesn't match {}x{}", w, h))?;
     img.save(out).context("save PNG")?;
-    Ok(())
+    Ok((w, h))
 }
 
 /// Multi-stream variant: connect once with the shared portal FD,
@@ -396,7 +421,7 @@ fn pipewire_capture_many_inner(
     fd: OwnedFd,
     node_ids: &[u32],
     outs: &[&Path],
-) -> Result<()> {
+) -> Result<Vec<(u32, u32)>> {
     use pipewire as pw;
     use pw::spa;
     use spa::pod::Pod;
@@ -550,6 +575,7 @@ fn pipewire_capture_many_inner(
 
     mainloop.run();
 
+    let mut dims = Vec::with_capacity(slots.len());
     for (idx, slot) in slots.iter().enumerate() {
         let captured = slot.borrow().captured.clone();
         let (w, h, rgba) = captured
@@ -557,8 +583,9 @@ fn pipewire_capture_many_inner(
         let img = image::RgbaImage::from_raw(w, h, rgba)
             .ok_or_else(|| anyhow!("stream {idx}: bad frame buffer size"))?;
         img.save(outs[idx]).with_context(|| format!("save {}", outs[idx].display()))?;
+        dims.push((w, h));
     }
-    Ok(())
+    Ok(dims)
 }
 
 fn bytes_per_pixel(f: pipewire::spa::param::video::VideoFormat) -> usize {
@@ -692,9 +719,13 @@ async fn main() -> Result<()> {
         Cmd::KeyUp { name } => client_call(daemon::Request::KeyUp { name }).await,
         Cmd::Type { text } => client_call(daemon::Request::Type { text }).await,
         Cmd::Move { x, y, stream } => client_call(daemon::Request::Move { x, y, stream }).await,
+        Cmd::MoveGlobal { x, y } => client_call(daemon::Request::MoveGlobal { x, y }).await,
         Cmd::Click { button } => client_call(daemon::Request::Click { button }).await,
         Cmd::ClickAt { x, y, button, stream } => {
             client_call(daemon::Request::ClickAt { x, y, button, stream }).await
+        }
+        Cmd::ClickGlobal { x, y, button } => {
+            client_call(daemon::Request::ClickAtGlobal { x, y, button }).await
         }
         Cmd::Screenshot { out } => client_call(daemon::Request::Screenshot { out }).await,
         Cmd::Streams => client_call(daemon::Request::Streams).await,
