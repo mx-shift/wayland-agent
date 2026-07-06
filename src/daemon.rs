@@ -78,7 +78,7 @@ pub enum Request {
     Type { text: String },
     /// Absolute pointer move on the given stream.  `x`/`y` are in
     /// screenshot-pixel space of that stream (what you read off the
-    /// PNG); the daemon scales them to the portal's logical space.
+    /// PNG) — they map 1:1 to the portal's pointer coordinates.
     Move { x: f64, y: f64, stream: usize },
     /// Press+release a pointer button at the current position.
     Click { button: String },
@@ -86,8 +86,9 @@ pub enum Request {
     ClickAt { x: f64, y: f64, button: String, stream: usize },
     /// Absolute pointer move in **global logical** coords (the space
     /// the extension reports window/monitor rects in).  The daemon
-    /// resolves which stream covers the point and subtracts its origin;
-    /// no scaling is applied (global coords are already logical).
+    /// resolves which stream covers the point, subtracts its origin, and
+    /// scales the offset up to the stream's physical frame space (what
+    /// the portal expects).
     MoveGlobal { x: f64, y: f64 },
     /// Move (global logical coords) + press + release.
     ClickAtGlobal { x: f64, y: f64, button: String },
@@ -150,13 +151,33 @@ impl Response {
 ///   HiDPI/fractional monitor it is `size * monitor_scale`, so a
 ///   screenshot PNG is bigger than the logical `size`.
 /// - The RemoteDesktop portal's `NotifyPointerMotionAbsolute` wants
-///   coordinates in the stream's **logical** space (i.e. `size`).
+///   coordinates in the stream's **physical** frame space — the same
+///   pixels a screenshot is in.  Mutter divides the incoming (x, y) by
+///   the monitor scale itself to reach global logical coords
+///   (`screen = logical_monitor.origin + stream_xy / scale`), so the
+///   caller must NOT pre-scale.
 ///
-/// So a pixel read off a screenshot (physical space) must be scaled by
-/// `size / frame_size` before it is a valid pointer coordinate.  That
-/// ratio is the "multiplier" callers kept reinventing; the daemon now
-/// applies it internally (see `screenshot_to_input`) so every command
-/// takes plain screenshot-pixel coordinates.
+/// Consequences for the two coordinate entry points:
+/// - A pixel read off a screenshot is already in physical frame space,
+///   so it maps to a portal coordinate **1:1** — no conversion, scaled
+///   monitor or not (see `screenshot_to_input`).
+/// - A global *logical* coordinate (from the extension) must be scaled
+///   **up** by `frame_size / size` (physical / logical) after the
+///   stream origin is subtracted, because the portal wants physical
+///   pixels (see `logical_local_to_frame`).
+///
+/// An earlier version scaled screenshot pixels *down* by `size /
+/// frame_size` before handing them to the portal; mutter then divided
+/// by the scale a second time, so every click landed at
+/// `target / scale`.  On an unscaled (1.0) monitor `size == frame_size`
+/// so the bug was invisible — which is why it only showed up on HiDPI.
+///
+/// Caveat (mutter fractional-scaling quirk): although the transform is
+/// physical, mutter validates the incoming coordinate against the
+/// monitor's *logical* rect, so it only accepts `0..size` and rejects
+/// anything in the `size..frame_size` margin with "Invalid position".
+/// On a scaled monitor that leaves the right/bottom of a
+/// physical-resolution screenshot unreachable by the pointer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StreamInfo {
     pub node_id: u32,
@@ -169,19 +190,29 @@ pub struct StreamInfo {
 }
 
 impl StreamInfo {
-    /// Convert a screenshot-pixel coordinate (physical space, what a
-    /// caller reads off the PNG) into the logical pointer coordinate the
-    /// RemoteDesktop portal expects.  Uses the cached `frame_size`
-    /// (physical) vs `size` (logical) ratio; if either is unknown the
-    /// conversion is 1:1 — correct for unscaled monitors, and the only
-    /// case where a pre-screenshot click on a scaled monitor could still
-    /// be off (take a screenshot first to prime the ratio).
+    /// Convert a screenshot-pixel coordinate (physical frame space, what
+    /// a caller reads off the PNG) into the pointer coordinate the
+    /// RemoteDesktop portal expects.  The portal wants physical
+    /// frame-space coordinates and applies the monitor scale itself, so
+    /// this is the identity — a screenshot pixel already IS a valid
+    /// portal coordinate, on scaled and unscaled monitors alike.
     pub fn screenshot_to_input(&self, x: f64, y: f64) -> (f64, f64) {
+        (x, y)
+    }
+
+    /// Convert a stream-local *logical* coordinate (a global logical
+    /// point with this stream's origin already subtracted) into the
+    /// physical frame-space coordinate the portal expects.  Scales up by
+    /// `frame_size / size` (physical / logical); 1:1 when `frame_size`
+    /// is unknown — correct for unscaled monitors, and the only case
+    /// where a click before the startup frame-size probe could be off on
+    /// a scaled monitor (take a screenshot first to prime the ratio).
+    pub fn logical_local_to_frame(&self, lx: f64, ly: f64) -> (f64, f64) {
         match (self.size, self.frame_size) {
-            (Some((lw, lh)), Some((fw, fh))) if fw > 0 && fh > 0 => {
-                (x * lw as f64 / fw as f64, y * lh as f64 / fh as f64)
+            (Some((lw, lh)), Some((fw, fh))) if lw > 0 && lh > 0 => {
+                (lx * fw as f64 / lw as f64, ly * fh as f64 / lh as f64)
             }
-            _ => (x, y),
+            _ => (lx, ly),
         }
     }
 }
@@ -202,18 +233,21 @@ impl StreamInfo {
     }
 }
 
-/// Resolve a global logical coordinate to (node_id, local_x, local_y).
-/// Finds the stream whose logical rect covers (x, y) and subtracts its
-/// origin.  Global coords are already logical, so no scaling — this is
-/// the path for coordinates that come from the gnome-shell extension
-/// (`windows`/`find-window`/`monitors`), not from a screenshot.
+/// Resolve a global logical coordinate to (node_id, frame_x, frame_y).
+/// Finds the stream whose logical rect covers (x, y), subtracts its
+/// origin, then scales the logical-local offset up to physical
+/// frame-space — the space the portal's `NotifyPointerMotionAbsolute`
+/// expects.  This is the path for coordinates that come from the
+/// gnome-shell extension (`windows`/`find-window`/`monitors`), which
+/// are logical, not from a screenshot.
 fn resolve_global(streams: &[StreamInfo], x: f64, y: f64) -> Result<(u32, f64, f64)> {
     let s = streams
         .iter()
         .find(|s| s.contains(x, y))
         .ok_or_else(|| anyhow!("no stream covers global point ({x}, {y})"))?;
     let (px, py) = s.position.ok_or_else(|| anyhow!("stream has no position"))?;
-    Ok((s.node_id, x - px as f64, y - py as f64))
+    let (fx, fy) = s.logical_local_to_frame(x - px as f64, y - py as f64);
+    Ok((s.node_id, fx, fy))
 }
 
 /// Shared state held across socket connections. Wrapped in a Mutex so

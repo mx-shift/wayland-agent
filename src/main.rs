@@ -92,8 +92,8 @@ enum Cmd {
 
     /// [portal] Move the pointer to (x, y) on the picked stream.
     /// Coordinates are screenshot pixels of that stream (0..W × 0..H of
-    /// its PNG); the daemon scales them to the portal's logical space,
-    /// so they match 1:1 with what you read off a `screenshot`.
+    /// its PNG) and map 1:1 to the pointer, so they match exactly what
+    /// you read off a `screenshot`.
     Move {
         x: f64,
         y: f64,
