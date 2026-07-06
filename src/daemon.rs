@@ -237,6 +237,15 @@ struct DaemonState {
     /// the PipeWire node id (for screenshot) plus the stream's monitor
     /// rect (for `stream-at` queries that don't need the extension).
     streams: Vec<StreamInfo>,
+    /// Serializes frame captures.  The screenshot handler drops the
+    /// main state lock before capturing (so key/pointer commands aren't
+    /// blocked for the seconds a capture takes), but two captures
+    /// running at once stand up two PipeWire streams on the *same*
+    /// nodes and collide — GNOME then fails both with "Buffer
+    /// allocation failed".  This lock lets overlapping screenshots queue
+    /// instead of colliding, without holding the main lock.  It's a
+    /// separate Arc so a capture can hold it across `spawn_blocking`.
+    capture_lock: Arc<Mutex<()>>,
 }
 
 /// Establish the portal session. May surface a consent dialog on
@@ -384,6 +393,7 @@ pub async fn run_daemon() -> Result<()> {
         rd, sc, session,
         pw_fd: fd,
         streams,
+        capture_lock: Arc::new(Mutex::new(())),
     }));
 
     let listener = UnixListener::bind(&sock).context("bind unix socket")?;
@@ -649,10 +659,16 @@ async fn dispatch(state_arc: Arc<Mutex<DaemonState>>, req: Request) -> Result<Re
             };
             let node_ids: Vec<u32> = state.streams.iter().map(|s| s.node_id).collect();
             let fd_dup = dup_fd(&state.pw_fd)?;
-            // Drop the lock before going off to PipeWire — it
+            let capture_lock = state.capture_lock.clone();
+            // Drop the main lock before going off to PipeWire — it
             // takes seconds and we don't want to block other
-            // socket clients during capture.
+            // socket clients (key/pointer) during capture.
             drop(state);
+
+            // Serialize captures: two PipeWire streams on the same nodes
+            // at once collide ("Buffer allocation failed").  Overlapping
+            // screenshots queue here instead.
+            let _cap = capture_lock.lock().await;
 
             let outs_clone = outs.clone();
             let dims = tokio::task::spawn_blocking(move || {
