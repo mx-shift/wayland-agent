@@ -290,10 +290,16 @@ fn resolve_global(streams: &[StreamInfo], x: f64, y: f64) -> Result<(u32, f64, f
 struct DaemonState {
     rd: RemoteDesktop,
     sc: Screencast,
-    /// Shared so the Closed-signal watcher (see `run_daemon`) can hold
-    /// its own reference for the process's lifetime while the command
-    /// handlers here still borrow it for portal calls.
+    /// Shared so the Closed-signal watcher (see `spawn_closed_watcher`)
+    /// can hold its own reference for the process's lifetime while the
+    /// command handlers here still borrow it for portal calls.
     session: Arc<Session<RemoteDesktop>>,
+    /// Bumped every time the session is re-established (display change).
+    /// A Closed-signal watcher is tagged with the generation it belongs
+    /// to; when the old session is deliberately closed during a
+    /// re-establish it must NOT bring the daemon down, so the watcher
+    /// only exits the process if its generation is still current.
+    generation: u64,
     /// PipeWire fd from the portal, kept owned for the daemon's
     /// lifetime. Each screenshot request `dup()`s it to get a fresh
     /// OwnedFd that pipewire-rs can consume (`connect_fd_rc` takes
@@ -402,6 +408,202 @@ fn dup_fd(fd: &OwnedFd) -> Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
+/// Prime each stream's physical frame size via a throwaway capture, so
+/// the first click/move is scaled correctly on HiDPI monitors before
+/// any screenshot has run. Best-effort: on failure the size is learned
+/// lazily on the first real screenshot (1:1 until then). See
+/// `pipewire_prime_frame_sizes_pub` for why this does a full capture
+/// rather than a lighter format-only probe.
+async fn prime_frame_sizes(fd: &OwnedFd, streams: &mut [StreamInfo]) {
+    let node_ids: Vec<u32> = streams.iter().map(|s| s.node_id).collect();
+    match dup_fd(fd) {
+        Ok(probe_fd) => {
+            let res = tokio::task::spawn_blocking(move || {
+                crate::pipewire_prime_frame_sizes_pub(probe_fd, &node_ids)
+            })
+            .await;
+            match res {
+                Ok(Ok(dims)) => {
+                    for (i, dim) in dims.iter().enumerate() {
+                        streams[i].frame_size = Some(*dim);
+                        eprintln!(
+                            "wayland-agent: stream[{}] frame_size={:?} (logical size={:?})",
+                            i, dim, streams[i].size
+                        );
+                    }
+                }
+                Ok(Err(e)) => eprintln!(
+                    "wayland-agent: frame-size probe failed ({e:#}); \
+                     will learn sizes lazily on first screenshot"
+                ),
+                Err(e) => eprintln!("wayland-agent: frame-size probe task panicked: {e}"),
+            }
+        }
+        Err(e) => eprintln!("wayland-agent: could not dup fd for probe: {e:#}"),
+    }
+}
+
+/// Establish a fresh portal session and prime its stream frame sizes.
+/// Used at startup and again on every display reconfiguration; returns
+/// the session already wrapped in an Arc (shared with its Closed
+/// watcher).
+async fn establish_and_prime() -> Result<(
+    RemoteDesktop,
+    Screencast,
+    Arc<Session<RemoteDesktop>>,
+    OwnedFd,
+    Vec<StreamInfo>,
+)> {
+    let (rd, sc, session, fd, mut streams) = establish_session().await?;
+    prime_frame_sizes(&fd, &mut streams).await;
+    Ok((rd, sc, Arc::new(session), fd, streams))
+}
+
+/// Watch a session's Closed signal and exit the daemon when it fires —
+/// unless that session has since been superseded by a re-establish (its
+/// generation is stale), in which case the watcher just retires
+/// quietly. Closing the old session during a re-establish is what makes
+/// the generation guard necessary.
+fn spawn_closed_watcher(
+    session: Arc<Session<RemoteDesktop>>,
+    generation: u64,
+    state: Arc<Mutex<DaemonState>>,
+    sock: PathBuf,
+) {
+    tokio::spawn(async move {
+        match session.receive_closed().await {
+            Ok(mut closed) => {
+                let _ = closed.next().await;
+                if state.lock().await.generation == generation {
+                    eprintln!(
+                        "wayland-agent: portal session closed (screen capture \
+                         stopped or consent revoked); exiting"
+                    );
+                    let _ = std::fs::remove_file(&sock);
+                    std::process::exit(0);
+                }
+                eprintln!(
+                    "wayland-agent: superseded session (generation {generation}) closed \
+                     after re-establish; watcher retiring"
+                );
+            }
+            Err(e) => eprintln!(
+                "wayland-agent: could not watch session Closed signal ({e:#}); \
+                 daemon will not auto-exit when capture stops"
+            ),
+        }
+    });
+}
+
+/// Re-establish the portal session after a display reconfiguration. The
+/// cached streams and PipeWire fd from the old layout are dead once the
+/// monitors change, so stand up a completely new session, prime it, and
+/// swap it into the shared state. A monitor-selection consent dialog may
+/// reappear — GNOME doesn't restore screencast streams from a token. The
+/// old session is closed afterwards; its Closed watcher sees the bumped
+/// generation and does not bring the daemon down.
+async fn reestablish(state: &Arc<Mutex<DaemonState>>, sock: &PathBuf) -> Result<()> {
+    // Build the new session WITHOUT holding the lock — it does several
+    // portal round-trips and may block on a consent prompt.
+    let (rd, sc, session, fd, streams) = establish_and_prime().await?;
+
+    let (old_session, generation) = {
+        let mut st = state.lock().await;
+        st.rd = rd;
+        st.sc = sc;
+        st.pw_fd = fd;
+        st.streams = streams;
+        st.generation += 1;
+        let generation = st.generation;
+        let old = std::mem::replace(&mut st.session, session.clone());
+        (old, generation)
+    };
+
+    spawn_closed_watcher(session, generation, state.clone(), sock.clone());
+
+    // Free the old session's portal resources. This fires its Closed
+    // signal, but that watcher now sees a stale generation and retires.
+    let _ = old_session.close().await;
+    eprintln!("wayland-agent: portal session re-established (generation {generation})");
+    Ok(())
+}
+
+/// Watch GNOME/mutter for display reconfigurations and re-establish the
+/// portal session when one happens, so the daemon survives a
+/// resolution/scale/layout change instead of serving stale streams.
+/// GNOME-specific (`org.gnome.Mutter.DisplayConfig`); on other
+/// compositors the subscription simply fails and the daemon keeps its
+/// "restart after a display change" behaviour.
+fn spawn_display_watcher(state: Arc<Mutex<DaemonState>>, sock: PathBuf) {
+    tokio::spawn(async move {
+        let conn = match zbus::Connection::session().await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "wayland-agent: no session bus for display watch ({e}); \
+                     will not auto-re-establish on display change"
+                );
+                return;
+            }
+        };
+        let proxy = match zbus::Proxy::new(
+            &conn,
+            "org.gnome.Mutter.DisplayConfig",
+            "/org/gnome/Mutter/DisplayConfig",
+            "org.gnome.Mutter.DisplayConfig",
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "wayland-agent: DisplayConfig unavailable ({e}); \
+                     will not auto-re-establish on display change"
+                );
+                return;
+            }
+        };
+        let mut changes = match proxy.receive_signal("MonitorsChanged").await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "wayland-agent: cannot watch MonitorsChanged ({e}); \
+                     will not auto-re-establish on display change"
+                );
+                return;
+            }
+        };
+
+        loop {
+            // Block until the first change of a burst.
+            if changes.next().await.is_none() {
+                return; // signal stream ended (bus gone)
+            }
+            // Debounce: one reconfiguration emits several MonitorsChanged
+            // in quick succession, and each re-establish may pop a consent
+            // dialog — coalesce until 2s of quiet before acting.
+            loop {
+                match tokio::time::timeout(std::time::Duration::from_secs(2), changes.next()).await
+                {
+                    Ok(Some(_)) => continue,
+                    Ok(None) => return,
+                    Err(_) => break,
+                }
+            }
+            eprintln!(
+                "wayland-agent: display reconfiguration detected; re-establishing \
+                 portal session (a monitor-selection prompt may appear)"
+            );
+            if let Err(e) = reestablish(&state, &sock).await {
+                eprintln!(
+                    "wayland-agent: re-establish after display change failed ({e:#}); \
+                     streams may be stale until the daemon is restarted"
+                );
+            }
+        }
+    });
+}
+
 pub async fn run_daemon() -> Result<()> {
     let sock = socket_path()?;
     if sock.exists() {
@@ -419,82 +621,23 @@ pub async fn run_daemon() -> Result<()> {
     }
 
     eprintln!("wayland-agent: establishing portal session (consent prompt may appear)...");
-    let (rd, sc, session, fd, mut streams) = establish_session().await?;
+    let (rd, sc, session, fd, streams) = establish_and_prime().await?;
     eprintln!("wayland-agent: session ready, {} stream(s)", streams.len());
 
-    let session = Arc::new(session);
-
-    // Terminate the daemon when the portal session is closed out from
-    // under us — the user hits "stop" on GNOME's screen-recording
-    // indicator, or revokes consent. At that point the cached streams
-    // and PipeWire fd are dead; a lingering daemon would just answer the
-    // socket with capture/input errors forever. Exiting cleanly means
-    // the next CLI call reports "daemon not running" and the user can
-    // restart it (with fresh consent), which is the recoverable state.
-    {
-        let session = session.clone();
-        let sock = sock.clone();
-        tokio::spawn(async move {
-            match session.receive_closed().await {
-                Ok(mut closed) => {
-                    let _ = closed.next().await;
-                    eprintln!(
-                        "wayland-agent: portal session closed (screen capture \
-                         stopped or consent revoked); exiting"
-                    );
-                    let _ = std::fs::remove_file(&sock);
-                    std::process::exit(0);
-                }
-                Err(e) => eprintln!(
-                    "wayland-agent: could not watch session Closed signal ({e:#}); \
-                     daemon will not auto-exit when capture stops"
-                ),
-            }
-        });
-    }
-
-    // Prime the physical frame size of each stream now, so the first
-    // click/move is scaled correctly on HiDPI monitors before any
-    // screenshot has run. This does a throwaway capture (pixels
-    // discarded) — the same path a real screenshot uses, which is the
-    // only one GNOME's screencast tears down cleanly. Non-fatal: on
-    // failure we fall back to learning the size lazily on the first
-    // screenshot (1:1 until then).
-    {
-        let node_ids: Vec<u32> = streams.iter().map(|s| s.node_id).collect();
-        match dup_fd(&fd) {
-            Ok(probe_fd) => {
-                let res = tokio::task::spawn_blocking(move || {
-                    crate::pipewire_prime_frame_sizes_pub(probe_fd, &node_ids)
-                })
-                .await;
-                match res {
-                    Ok(Ok(dims)) => {
-                        for (i, dim) in dims.iter().enumerate() {
-                            streams[i].frame_size = Some(*dim);
-                            eprintln!(
-                                "wayland-agent: stream[{}] frame_size={:?} (logical size={:?})",
-                                i, dim, streams[i].size
-                            );
-                        }
-                    }
-                    Ok(Err(e)) => eprintln!(
-                        "wayland-agent: frame-size probe failed ({e:#}); \
-                         will learn sizes lazily on first screenshot"
-                    ),
-                    Err(e) => eprintln!("wayland-agent: frame-size probe task panicked: {e}"),
-                }
-            }
-            Err(e) => eprintln!("wayland-agent: could not dup fd for probe: {e:#}"),
-        }
-    }
-
     let state = Arc::new(Mutex::new(DaemonState {
-        rd, sc, session,
+        rd, sc,
+        session: session.clone(),
         pw_fd: fd,
         streams,
         capture_lock: Arc::new(Mutex::new(())),
+        generation: 0,
     }));
+
+    // Exit the daemon if the portal session is closed out from under us
+    // (user hits "stop" on GNOME's screen-recording indicator, or
+    // revokes consent); re-establish it if the display is reconfigured.
+    spawn_closed_watcher(session, 0, state.clone(), sock.clone());
+    spawn_display_watcher(state.clone(), sock.clone());
 
     let listener = UnixListener::bind(&sock).context("bind unix socket")?;
     let perms = std::fs::Permissions::from_mode(0o600);
