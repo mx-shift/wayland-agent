@@ -215,6 +215,36 @@ impl StreamInfo {
             _ => (lx, ly),
         }
     }
+
+    /// Verify a final portal coordinate (physical frame space, what
+    /// `NotifyPointerMotionAbsolute` receives) lands in the range mutter
+    /// will accept.  Per the type doc, mutter validates incoming
+    /// remote-desktop coordinates against the monitor's *logical* rect
+    /// even though it treats them as physical, so anything at or beyond
+    /// `size` is rejected with a bare "Invalid position".  Catch that
+    /// here and explain the fractional-scaling limitation instead.
+    ///
+    /// No-op when the portal didn't report `size` (Window-source
+    /// streams): there's no rect to bound against, so let the portal
+    /// decide.
+    fn check_reachable(&self, ix: f64, iy: f64) -> Result<()> {
+        let Some((lw, lh)) = self.size else { return Ok(()) };
+        let (lwf, lhf) = (lw as f64, lh as f64);
+        if ix < 0.0 || iy < 0.0 || ix >= lwf || iy >= lhf {
+            let frame = self
+                .frame_size
+                .map(|(w, h)| format!("{w}x{h}"))
+                .unwrap_or_else(|| "?".into());
+            return Err(anyhow!(
+                "point ({ix:.0}, {iy:.0}) is outside this monitor's reachable \
+                 pointer range 0..{lw} x 0..{lh}. GNOME/mutter validates \
+                 remote-desktop coordinates against the monitor's LOGICAL size, \
+                 so on a fractional/HiDPI monitor the right/bottom margin of a \
+                 physical-resolution screenshot ({frame}) can't be clicked."
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl StreamInfo {
@@ -247,6 +277,7 @@ fn resolve_global(streams: &[StreamInfo], x: f64, y: f64) -> Result<(u32, f64, f
         .ok_or_else(|| anyhow!("no stream covers global point ({x}, {y})"))?;
     let (px, py) = s.position.ok_or_else(|| anyhow!("stream has no position"))?;
     let (fx, fy) = s.logical_local_to_frame(x - px as f64, y - py as f64);
+    s.check_reachable(fx, fy)?;
     Ok((s.node_id, fx, fy))
 }
 
@@ -615,6 +646,7 @@ async fn dispatch(state_arc: Arc<Mutex<DaemonState>>, req: Request) -> Result<Re
                 .ok_or_else(|| anyhow!("stream {stream} out of range"))?;
             let node = s.node_id;
             let (ix, iy) = s.screenshot_to_input(x, y);
+            s.check_reachable(ix, iy)?;
             state.rd.notify_pointer_motion_absolute(
                 &state.session, node, ix, iy,
                 NotifyPointerMotionAbsoluteOptions::default(),
@@ -646,6 +678,7 @@ async fn dispatch(state_arc: Arc<Mutex<DaemonState>>, req: Request) -> Result<Re
                 .ok_or_else(|| anyhow!("stream {stream} out of range"))?;
             let node = s.node_id;
             let (ix, iy) = s.screenshot_to_input(x, y);
+            s.check_reachable(ix, iy)?;
             let code = crate::button_code(&button)?;
             state.rd.notify_pointer_motion_absolute(
                 &state.session, node, ix, iy,
