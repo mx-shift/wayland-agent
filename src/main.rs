@@ -204,22 +204,49 @@ pub(crate) fn pipewire_capture_frames_pub(
     node_ids: &[u32],
     outs: &[&Path],
 ) -> Result<Vec<(u32, u32)>> {
-    pipewire_capture_frames(fd, node_ids, outs)
+    pipewire_capture_frames(fd, node_ids, Some(outs))
 }
 
-fn pipewire_capture_frames(fd: OwnedFd, node_ids: &[u32], outs: &[&Path]) -> Result<Vec<(u32, u32)>> {
-    assert_eq!(node_ids.len(), outs.len(), "node_ids/outs length mismatch");
+/// Capture one frame per node purely to learn each stream's physical
+/// size, then discard the pixels. Returns (width, height) per node.
+///
+/// This deliberately reuses the full capture path — negotiate buffers,
+/// receive one real frame, tear down cleanly — rather than a lighter
+/// "just read the negotiated format" probe. A probe that quits during
+/// format negotiation (before buffers are allocated) leaves GNOME's
+/// screencast node with a half-allocated buffer pool, and every
+/// subsequent capture then fails with "Buffer allocation failed". Doing
+/// a real throwaway capture is the only teardown GNOME handles cleanly.
+pub(crate) fn pipewire_prime_frame_sizes_pub(
+    fd: OwnedFd,
+    node_ids: &[u32],
+) -> Result<Vec<(u32, u32)>> {
+    pipewire_capture_frames(fd, node_ids, None)
+}
+
+/// Capture one frame per node. When `outs` is `Some`, each frame is
+/// saved as a PNG to the matching path; when `None`, frames are
+/// captured only to measure their physical size and then dropped.
+/// Returns (width, height) per node in `node_ids` order.
+fn pipewire_capture_frames(
+    fd: OwnedFd,
+    node_ids: &[u32],
+    outs: Option<&[&Path]>,
+) -> Result<Vec<(u32, u32)>> {
+    if let Some(o) = outs {
+        assert_eq!(node_ids.len(), o.len(), "node_ids/outs length mismatch");
+    }
     // For single-stream we delegate to the original single-frame
     // path to keep the well-tested code working unchanged. Multi-
     // stream uses a fanout below.
     if node_ids.len() == 1 {
-        let dim = pipewire_capture_one_frame_inner(fd, node_ids[0], outs[0])?;
+        let dim = pipewire_capture_one_frame_inner(fd, node_ids[0], outs.map(|o| o[0]))?;
         return Ok(vec![dim]);
     }
     pipewire_capture_many_inner(fd, node_ids, outs)
 }
 
-fn pipewire_capture_one_frame_inner(fd: OwnedFd, node_id: u32, out: &Path) -> Result<(u32, u32)> {
+fn pipewire_capture_one_frame_inner(fd: OwnedFd, node_id: u32, out: Option<&Path>) -> Result<(u32, u32)> {
     use pipewire as pw;
     use pw::spa;
     use spa::pod::Pod;
@@ -406,9 +433,11 @@ fn pipewire_capture_one_frame_inner(fd: OwnedFd, node_id: u32, out: &Path) -> Re
     let captured = state.borrow().captured.clone();
     let (w, h, rgba) = captured.ok_or_else(|| anyhow!("no frame captured"))?;
 
-    let img = image::RgbaImage::from_raw(w, h, rgba)
-        .ok_or_else(|| anyhow!("frame buffer length doesn't match {}x{}", w, h))?;
-    img.save(out).context("save PNG")?;
+    if let Some(out) = out {
+        let img = image::RgbaImage::from_raw(w, h, rgba)
+            .ok_or_else(|| anyhow!("frame buffer length doesn't match {}x{}", w, h))?;
+        img.save(out).context("save PNG")?;
+    }
     Ok((w, h))
 }
 
@@ -420,7 +449,7 @@ fn pipewire_capture_one_frame_inner(fd: OwnedFd, node_id: u32, out: &Path) -> Re
 fn pipewire_capture_many_inner(
     fd: OwnedFd,
     node_ids: &[u32],
-    outs: &[&Path],
+    outs: Option<&[&Path]>,
 ) -> Result<Vec<(u32, u32)>> {
     use pipewire as pw;
     use pw::spa;
@@ -580,9 +609,11 @@ fn pipewire_capture_many_inner(
         let captured = slot.borrow().captured.clone();
         let (w, h, rgba) = captured
             .ok_or_else(|| anyhow!("stream {idx}: no frame captured before quit"))?;
-        let img = image::RgbaImage::from_raw(w, h, rgba)
-            .ok_or_else(|| anyhow!("stream {idx}: bad frame buffer size"))?;
-        img.save(outs[idx]).with_context(|| format!("save {}", outs[idx].display()))?;
+        if let Some(outs) = outs {
+            let img = image::RgbaImage::from_raw(w, h, rgba)
+                .ok_or_else(|| anyhow!("stream {idx}: bad frame buffer size"))?;
+            img.save(outs[idx]).with_context(|| format!("save {}", outs[idx].display()))?;
+        }
         dims.push((w, h));
     }
     Ok(dims)

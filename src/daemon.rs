@@ -341,8 +341,44 @@ pub async fn run_daemon() -> Result<()> {
     }
 
     eprintln!("wayland-agent: establishing portal session (consent prompt may appear)...");
-    let (rd, sc, session, fd, streams) = establish_session().await?;
+    let (rd, sc, session, fd, mut streams) = establish_session().await?;
     eprintln!("wayland-agent: session ready, {} stream(s)", streams.len());
+
+    // Prime the physical frame size of each stream now, so the first
+    // click/move is scaled correctly on HiDPI monitors before any
+    // screenshot has run. This does a throwaway capture (pixels
+    // discarded) — the same path a real screenshot uses, which is the
+    // only one GNOME's screencast tears down cleanly. Non-fatal: on
+    // failure we fall back to learning the size lazily on the first
+    // screenshot (1:1 until then).
+    {
+        let node_ids: Vec<u32> = streams.iter().map(|s| s.node_id).collect();
+        match dup_fd(&fd) {
+            Ok(probe_fd) => {
+                let res = tokio::task::spawn_blocking(move || {
+                    crate::pipewire_prime_frame_sizes_pub(probe_fd, &node_ids)
+                })
+                .await;
+                match res {
+                    Ok(Ok(dims)) => {
+                        for (i, dim) in dims.iter().enumerate() {
+                            streams[i].frame_size = Some(*dim);
+                            eprintln!(
+                                "wayland-agent: stream[{}] frame_size={:?} (logical size={:?})",
+                                i, dim, streams[i].size
+                            );
+                        }
+                    }
+                    Ok(Err(e)) => eprintln!(
+                        "wayland-agent: frame-size probe failed ({e:#}); \
+                         will learn sizes lazily on first screenshot"
+                    ),
+                    Err(e) => eprintln!("wayland-agent: frame-size probe task panicked: {e}"),
+                }
+            }
+            Err(e) => eprintln!("wayland-agent: could not dup fd for probe: {e:#}"),
+        }
+    }
 
     let state = Arc::new(Mutex::new(DaemonState {
         rd, sc, session,
