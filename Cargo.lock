@@ -2083,6 +2083,7 @@ dependencies = [
  "ashpd",
  "clap",
  "enumflags2",
+ "futures-util",
  "image",
  "libc",
  "pipewire",

@@ -43,6 +43,7 @@ use ashpd::desktop::{
         CursorMode, OpenPipeWireRemoteOptions, Screencast, SelectSourcesOptions, SourceType,
     },
 };
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -289,7 +290,10 @@ fn resolve_global(streams: &[StreamInfo], x: f64, y: f64) -> Result<(u32, f64, f
 struct DaemonState {
     rd: RemoteDesktop,
     sc: Screencast,
-    session: Session<RemoteDesktop>,
+    /// Shared so the Closed-signal watcher (see `run_daemon`) can hold
+    /// its own reference for the process's lifetime while the command
+    /// handlers here still borrow it for portal calls.
+    session: Arc<Session<RemoteDesktop>>,
     /// PipeWire fd from the portal, kept owned for the daemon's
     /// lifetime. Each screenshot request `dup()`s it to get a fresh
     /// OwnedFd that pipewire-rs can consume (`connect_fd_rc` takes
@@ -417,6 +421,37 @@ pub async fn run_daemon() -> Result<()> {
     eprintln!("wayland-agent: establishing portal session (consent prompt may appear)...");
     let (rd, sc, session, fd, mut streams) = establish_session().await?;
     eprintln!("wayland-agent: session ready, {} stream(s)", streams.len());
+
+    let session = Arc::new(session);
+
+    // Terminate the daemon when the portal session is closed out from
+    // under us — the user hits "stop" on GNOME's screen-recording
+    // indicator, or revokes consent. At that point the cached streams
+    // and PipeWire fd are dead; a lingering daemon would just answer the
+    // socket with capture/input errors forever. Exiting cleanly means
+    // the next CLI call reports "daemon not running" and the user can
+    // restart it (with fresh consent), which is the recoverable state.
+    {
+        let session = session.clone();
+        let sock = sock.clone();
+        tokio::spawn(async move {
+            match session.receive_closed().await {
+                Ok(mut closed) => {
+                    let _ = closed.next().await;
+                    eprintln!(
+                        "wayland-agent: portal session closed (screen capture \
+                         stopped or consent revoked); exiting"
+                    );
+                    let _ = std::fs::remove_file(&sock);
+                    std::process::exit(0);
+                }
+                Err(e) => eprintln!(
+                    "wayland-agent: could not watch session Closed signal ({e:#}); \
+                     daemon will not auto-exit when capture stops"
+                ),
+            }
+        });
+    }
 
     // Prime the physical frame size of each stream now, so the first
     // click/move is scaled correctly on HiDPI monitors before any
