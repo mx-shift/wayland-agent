@@ -224,6 +224,15 @@ pub(crate) fn pipewire_prime_frame_sizes_pub(
     pipewire_capture_frames(fd, node_ids, None)
 }
 
+/// Max wall-clock a single capture may wait for frames before it is
+/// abandoned. A healthy capture delivers within well under a second;
+/// if GNOME's screencast stalls (stream reaches Streaming but no buffer
+/// ever arrives) the mainloop would otherwise block forever, and since
+/// the daemon holds `capture_lock` across the capture that wedges every
+/// subsequent screenshot too. The watchdog turns that into a timeout
+/// error so the daemon recovers.
+const CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Capture one frame per node. When `outs` is `Some`, each frame is
 /// saved as a PNG to the matching path; when `None`, frames are
 /// captured only to measure their physical size and then dropped.
@@ -423,12 +432,29 @@ fn pipewire_capture_one_frame_inner(fd: OwnedFd, node_id: u32, out: Option<&Path
         )
         .context("pw stream connect")?;
 
-    // No watchdog: pipewire-rs 0.9's MainLoopRc isn't Send, so a
-    // background-thread timer that calls quit() can't compile. In
-    // practice the process handler quits as soon as we've copied
-    // one frame; if format negotiation never converges the caller
-    // can SIGINT.
+    // Watchdog: a background-thread timer can't call quit() because
+    // MainLoopRc isn't Send, but a pw timer *source* runs inside the
+    // loop thread, so its callback may quit() freely. Arm a one-shot
+    // that fires if no frame arrives within CAPTURE_TIMEOUT, so a
+    // stalled screencast becomes an error instead of an infinite hang.
+    let timed_out = Rc::new(std::cell::Cell::new(false));
+    let timed_out_cb = timed_out.clone();
+    let main_for_timeout = mainloop.clone();
+    let timer = mainloop.loop_().add_timer(move |_| {
+        timed_out_cb.set(true);
+        main_for_timeout.quit();
+    });
+    let _ = timer.update_timer(Some(CAPTURE_TIMEOUT), None);
+
     mainloop.run();
+
+    if timed_out.get() {
+        return Err(anyhow!(
+            "capture timed out after {}s: node {node_id} reached Streaming but \
+             GNOME screencast delivered no frame",
+            CAPTURE_TIMEOUT.as_secs()
+        ));
+    }
 
     let captured = state.borrow().captured.clone();
     let (w, h, rgba) = captured.ok_or_else(|| anyhow!("no frame captured"))?;
@@ -602,7 +628,29 @@ fn pipewire_capture_many_inner(
         streams.push(stream);
     }
 
+    // Watchdog (see pipewire_capture_one_frame_inner): quit from an
+    // in-loop timer if the capture stalls, so an unresponsive screencast
+    // times out instead of hanging forever and wedging capture_lock.
+    let timed_out = Rc::new(std::cell::Cell::new(false));
+    let timed_out_cb = timed_out.clone();
+    let main_for_timeout = mainloop.clone();
+    let timer = mainloop.loop_().add_timer(move |_| {
+        timed_out_cb.set(true);
+        main_for_timeout.quit();
+    });
+    let _ = timer.update_timer(Some(CAPTURE_TIMEOUT), None);
+
     mainloop.run();
+
+    if timed_out.get() {
+        let captured = slots.iter().filter(|s| s.borrow().captured.is_some()).count();
+        return Err(anyhow!(
+            "capture timed out after {}s: {captured}/{} streams delivered a frame \
+             before GNOME screencast stalled",
+            CAPTURE_TIMEOUT.as_secs(),
+            slots.len()
+        ));
+    }
 
     let mut dims = Vec::with_capacity(slots.len());
     for (idx, slot) in slots.iter().enumerate() {
