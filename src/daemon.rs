@@ -83,6 +83,8 @@ pub enum Request {
     Move { x: f64, y: f64, stream: usize },
     /// Press+release a pointer button at the current position.
     Click { button: String },
+    ButtonDown { button: String },
+    ButtonUp { button: String },
     /// Move + press + release, in screenshot-pixel space of `stream`.
     ClickAt { x: f64, y: f64, button: String, stream: usize },
     /// Absolute pointer move in **global logical** coords (the space
@@ -845,6 +847,22 @@ async fn dispatch(state_arc: Arc<Mutex<DaemonState>>, req: Request) -> Result<Re
                 &state.session, code, KeyState::Pressed,
                 NotifyPointerButtonOptions::default(),
             ).await?;
+            state.rd.notify_pointer_button(
+                &state.session, code, KeyState::Released,
+                NotifyPointerButtonOptions::default(),
+            ).await?;
+            Ok(Response::ok())
+        }
+        Request::ButtonDown { button } => {
+            let code = crate::button_code(&button)?;
+            state.rd.notify_pointer_button(
+                &state.session, code, KeyState::Pressed,
+                NotifyPointerButtonOptions::default(),
+            ).await?;
+            Ok(Response::ok())
+        }
+        Request::ButtonUp { button } => {
+            let code = crate::button_code(&button)?;
             state.rd.notify_pointer_button(
                 &state.session, code, KeyState::Released,
                 NotifyPointerButtonOptions::default(),

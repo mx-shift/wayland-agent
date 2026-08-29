@@ -114,6 +114,22 @@ enum Cmd {
         button: String,
     },
 
+    /// [portal] Press AND HOLD a pointer button until a matching
+    /// `button-up`.  This is the primitive classic-Mac menu tracking
+    /// and drag-and-drop need: button-down, `move` the pointer, then
+    /// `button-up` over the target.
+    ButtonDown {
+        #[arg(long, default_value = "left")]
+        button: String,
+    },
+
+    /// [portal] Release a pointer button previously held with
+    /// `button-down`.
+    ButtonUp {
+        #[arg(long, default_value = "left")]
+        button: String,
+    },
+
     /// [portal] Move pointer to (x, y) on the picked stream, then
     /// click.  Coordinates are screenshot pixels of that stream (same
     /// space as `screenshot` output).  Useful for focusing a window
@@ -800,6 +816,10 @@ async fn main() -> Result<()> {
         Cmd::Move { x, y, stream } => client_call(daemon::Request::Move { x, y, stream }).await,
         Cmd::MoveGlobal { x, y } => client_call(daemon::Request::MoveGlobal { x, y }).await,
         Cmd::Click { button } => client_call(daemon::Request::Click { button }).await,
+        Cmd::ButtonDown { button } => {
+            client_call(daemon::Request::ButtonDown { button }).await
+        }
+        Cmd::ButtonUp { button } => client_call(daemon::Request::ButtonUp { button }).await,
         Cmd::ClickAt { x, y, button, stream } => {
             client_call(daemon::Request::ClickAt { x, y, button, stream }).await
         }
