@@ -231,6 +231,22 @@ enum Cmd {
         #[arg(long)]
         client: bool,
     },
+
+    /// [ext+portal] Focus a window, then type a UTF-8 string into it —
+    /// one command, no separate `focus`/`click` step.  WINDOW resolves
+    /// like `click-in` (numeric id or a pattern matching exactly one
+    /// window; ambiguity errors with the candidate list) and the
+    /// command waits for focus to land before the first keystroke.
+    /// Typing semantics match `type`: one press+release per character,
+    /// `key-chord` for modifier combos.
+    TypeIn {
+        window: String,
+        text: String,
+        /// Milliseconds to wait after each character; omit for full
+        /// speed.  Set ~20-30 for DOSBox's emulated keyboard.
+        #[arg(long)]
+        delay: Option<u64>,
+    },
 }
 
 pub(crate) fn button_code(name: &str) -> Result<i32> {
@@ -876,6 +892,9 @@ async fn main() -> Result<()> {
         }
         Cmd::ClickIn { window, x, y, button, client } => {
             client_call(daemon::Request::ClickWindow { window, x, y, button, client }).await
+        }
+        Cmd::TypeIn { window, text, delay } => {
+            client_call(daemon::Request::TypeWindow { window, text, delay }).await
         }
     }
 }

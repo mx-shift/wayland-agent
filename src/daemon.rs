@@ -137,6 +137,15 @@ pub enum Request {
         #[serde(default)]
         client: bool,
     },
+    /// Focus a window, then type a UTF-8 string into it — same window
+    /// resolution and focus-wait as ClickWindow, same typing semantics
+    /// (incl. per-char `delay` pacing) as Type.
+    TypeWindow {
+        window: String,
+        text: String,
+        #[serde(default)]
+        delay: Option<u64>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -752,6 +761,11 @@ async fn dispatch(state_arc: Arc<Mutex<DaemonState>>, req: Request) -> Result<Re
             drop(state);
             click_window(&state_arc, window, x, y, button, client).await
         }
+        Request::TypeWindow { window, text, delay } => {
+            // Same extension+portal split as ClickWindow.
+            drop(state);
+            type_window(&state_arc, window, text, delay).await
+        }
         Request::Key { name } => {
             let sym = crate::keysym_from_name(&name)
                 .ok_or_else(|| anyhow!("unknown keysym {name:?}"))?;
@@ -834,23 +848,7 @@ async fn dispatch(state_arc: Arc<Mutex<DaemonState>>, req: Request) -> Result<Re
             Ok(Response::ok())
         }
         Request::Type { text, delay } => {
-            for ch in text.chars() {
-                let sym = crate::keysym_for_char(ch)
-                    .ok_or_else(|| anyhow!("char {ch:?} has no mapped keysym"))?;
-                state.rd.notify_keyboard_keysym(
-                    &state.session, sym, KeyState::Pressed,
-                    NotifyKeyboardKeysymOptions::default(),
-                ).await?;
-                state.rd.notify_keyboard_keysym(
-                    &state.session, sym, KeyState::Released,
-                    NotifyKeyboardKeysymOptions::default(),
-                ).await?;
-                // Pace for slow consumers (e.g. DOSBox's emulated keyboard,
-                // which drops characters typed faster than it can drain).
-                if let Some(ms) = delay {
-                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-                }
-            }
+            type_text(&state, &text, delay).await?;
             Ok(Response::ok())
         }
         Request::Move { x, y, stream } => {
@@ -1154,34 +1152,24 @@ fn resolve_window_selector(windows: Vec<WindowDict>, sel: &str) -> Result<Window
     }
 }
 
-/// The `click-in` implementation: resolve the window, focus it if it
-/// isn't already (waiting for focus to actually land so the click
-/// doesn't race the raise), re-read its geometry, translate the
-/// window-relative offset to a global-logical point, and click.
-async fn click_window(
-    state_arc: &Arc<Mutex<DaemonState>>,
-    sel: String,
-    x: f64,
-    y: f64,
-    button: String,
-    client: bool,
-) -> Result<Response> {
-    let code = crate::button_code(&button)?;
+/// Resolve a window selector against the current window list, focus
+/// the window if it isn't already, and wait for focus to actually land
+/// (re-reading geometry, which also picks up a post-raise/unminimize
+/// move).  Some windows never take keyboard focus — proceed after the
+/// deadline rather than failing.  Shared by `click-in` and `type-in`.
+async fn resolve_and_focus(sel: &str) -> Result<WindowDict> {
     let proxy = ext_proxy().await?;
     let windows: Vec<WindowDict> = proxy.call("GetWindows", &()).await.map_err(|e| {
         anyhow!("GetWindows on com.mxshift.WaylandAgent failed: {e}\n{EXT_NOT_FOUND_HINT}")
     })?;
-    let mut win = resolve_window_selector(windows, &sel)?;
+    let mut win = resolve_window_selector(windows, sel)?;
     let id = dict_i64(&win, "id")? as u64;
 
     if !dict_bool(&win, "focused") {
         let _: () = proxy.call("FocusWindow", &(id,)).await.map_err(|e| {
             anyhow!("FocusWindow on com.mxshift.WaylandAgent failed: {e}\n{EXT_NOT_FOUND_HINT}")
         })?;
-        // Activation is asynchronous in mutter; poll until the window
-        // reports focus (also picks up post-raise/unminimize geometry).
-        // Some windows never take keyboard focus — proceed after the
-        // deadline rather than failing the click.
+        // Activation is asynchronous in mutter; poll until it lands.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1193,6 +1181,22 @@ async fn click_window(
             }
         }
     }
+    Ok(win)
+}
+
+/// The `click-in` implementation: resolve + focus the window, translate
+/// the window-relative offset to a global-logical point, and click.
+async fn click_window(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    sel: String,
+    x: f64,
+    y: f64,
+    button: String,
+    client: bool,
+) -> Result<Response> {
+    let code = crate::button_code(&button)?;
+    let win = resolve_and_focus(&sel).await?;
+    let id = dict_i64(&win, "id")?;
 
     let (prefix, label) = if client { ("client", "client area") } else { ("frame", "frame") };
     let ox = dict_i64(&win, &format!("{prefix}_x"))? as f64;
@@ -1225,6 +1229,49 @@ async fn click_window(
     Ok(Response::ok_detail(format!(
         "clicked {button} at ({x:.0}, {y:.0}) relative to window {id}'s {label} \
          (global {gx:.0}, {gy:.0})"
+    )))
+}
+
+/// Type `text` into whatever currently holds keyboard focus, one
+/// press+release per character.  `delay` is milliseconds to wait after
+/// each character — pacing for slow consumers (e.g. DOSBox's emulated
+/// keyboard, which drops characters typed faster than it can drain).
+async fn type_text(state: &DaemonState, text: &str, delay: Option<u64>) -> Result<()> {
+    for ch in text.chars() {
+        let sym = crate::keysym_for_char(ch)
+            .ok_or_else(|| anyhow!("char {ch:?} has no mapped keysym"))?;
+        state.rd.notify_keyboard_keysym(
+            &state.session, sym, KeyState::Pressed,
+            NotifyKeyboardKeysymOptions::default(),
+        ).await?;
+        state.rd.notify_keyboard_keysym(
+            &state.session, sym, KeyState::Released,
+            NotifyKeyboardKeysymOptions::default(),
+        ).await?;
+        if let Some(ms) = delay {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        }
+    }
+    Ok(())
+}
+
+/// The `type-in` implementation: resolve + focus the window, then type
+/// into it.  No pointer movement — keyboard input follows focus, so
+/// focusing is all the targeting `type` needs.
+async fn type_window(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    sel: String,
+    text: String,
+    delay: Option<u64>,
+) -> Result<Response> {
+    let win = resolve_and_focus(&sel).await?;
+    let id = dict_i64(&win, "id")?;
+    let nchars = text.chars().count();
+
+    let state = state_arc.lock().await;
+    type_text(&state, &text, delay).await?;
+    Ok(Response::ok_detail(format!(
+        "typed {nchars} character(s) into window {id}"
     )))
 }
 
