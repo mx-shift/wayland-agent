@@ -189,10 +189,19 @@ enum Cmd {
     /// global-screen rect, scale, primary flag.
     Monitors,
 
-    /// [ext] Find the first window whose wm_class, app_id, or title
-    /// contains the (case-insensitive) pattern.  Prints the window's
-    /// full metadata dict.
-    FindWindow { pattern: String },
+    /// [ext] Find the window whose wm_class, app_id, or title contains
+    /// the (case-insensitive) pattern.  Exactly one match prints its
+    /// full metadata dict.  Several matches is an ERROR listing each
+    /// candidate (id, wm_class, title, ...) so you can refine the
+    /// pattern or target an id — pass --all to print every match
+    /// instead.
+    FindWindow {
+        pattern: String,
+        /// Print every matching window instead of erroring when the
+        /// pattern is ambiguous.
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 pub(crate) fn button_code(name: &str) -> Result<i32> {
@@ -833,7 +842,9 @@ async fn main() -> Result<()> {
         Cmd::Window { id } => client_call(daemon::Request::Window { id }).await,
         Cmd::Focus { id } => client_call(daemon::Request::FocusWindow { id }).await,
         Cmd::Monitors => client_call(daemon::Request::Monitors).await,
-        Cmd::FindWindow { pattern } => client_call(daemon::Request::FindWindow { pattern }).await,
+        Cmd::FindWindow { pattern, all } => {
+            client_call(daemon::Request::FindWindow { pattern, all }).await
+        }
     }
 }
 

@@ -114,9 +114,15 @@ pub enum Request {
     FocusWindow { id: u64 },
     /// List monitors with geometry + scale.
     Monitors,
-    /// Find the first window whose wm_class/app_id/title matches `pattern`.
-    /// Match is case-insensitive substring.
-    FindWindow { pattern: String },
+    /// Find the window whose wm_class/app_id/title matches `pattern`
+    /// (case-insensitive substring).  Exactly one match prints its full
+    /// metadata; several matches is an error listing the candidates
+    /// unless `all` is set, which prints every match.
+    FindWindow {
+        pattern: String,
+        #[serde(default)]
+        all: bool,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1047,6 +1053,38 @@ fn fmt_dicts(label: &str, dicts: &[std::collections::HashMap<String, zvariant::O
     out.trim_end().to_string()
 }
 
+type WindowDict = std::collections::HashMap<String, zvariant::OwnedValue>;
+
+/// Case-insensitive substring match against a window's wm_class,
+/// app_id, and title — the find-window matching rule.
+fn window_matches(w: &WindowDict, pattern: &str) -> bool {
+    let needle = pattern.to_lowercase();
+    ["wm_class", "app_id", "title"].iter().any(|k| {
+        w.get(*k)
+            .map(|v| render_value(v).to_lowercase().contains(&needle))
+            .unwrap_or(false)
+    })
+}
+
+/// One line per window — enough for a caller to pick an id.
+fn summarize_windows(windows: &[WindowDict]) -> String {
+    windows
+        .iter()
+        .map(|w| {
+            let s = |k: &str| w.get(k).map(render_value).unwrap_or_default();
+            format!(
+                "  id={}\twm_class={:?}\tapp_id={:?}\tfocused={}\ttitle={:?}",
+                s("id"),
+                s("wm_class"),
+                s("app_id"),
+                s("focused"),
+                s("title"),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 async fn dispatch_extension(req: Request) -> Result<Response> {
     let proxy = ext_proxy().await?;
 
@@ -1082,26 +1120,24 @@ async fn dispatch_extension(req: Request) -> Result<Response> {
                 })?;
             Ok(Response::ok_detail(fmt_dicts("monitor", &monitors)))
         }
-        Request::FindWindow { pattern } => {
-            let windows: Vec<std::collections::HashMap<String, zvariant::OwnedValue>> =
+        Request::FindWindow { pattern, all } => {
+            let windows: Vec<WindowDict> =
                 proxy.call("GetWindows", &()).await.map_err(|e| {
                     anyhow!("GetWindows on com.mxshift.WaylandAgent failed: {e}\n{EXT_NOT_FOUND_HINT}")
                 })?;
-            let needle = pattern.to_lowercase();
-            let hit = windows.into_iter().find(|w| {
-                for k in ["wm_class", "app_id", "title"] {
-                    if let Some(v) = w.get(k) {
-                        let s = render_value(v).to_lowercase();
-                        if s.contains(&needle) {
-                            return true;
-                        }
-                    }
-                }
-                false
-            });
-            match hit {
-                Some(w) => Ok(Response::ok_detail(fmt_dicts("match", &[w]))),
-                None => Err(anyhow!("no window matched {pattern:?}")),
+            let matches: Vec<WindowDict> = windows
+                .into_iter()
+                .filter(|w| window_matches(w, &pattern))
+                .collect();
+            match matches.len() {
+                0 => Err(anyhow!("no window matched {pattern:?}")),
+                1 => Ok(Response::ok_detail(fmt_dicts("match", &matches))),
+                _ if all => Ok(Response::ok_detail(fmt_dicts("match", &matches))),
+                n => Err(anyhow!(
+                    "{n} windows match {pattern:?} — refine the pattern, target one \
+                     by id (`window <id>`), or pass --all to list every match:\n{}",
+                    summarize_windows(&matches)
+                )),
             }
         }
         _ => unreachable!("dispatch_extension called with non-extension request"),
@@ -1128,3 +1164,27 @@ pub async fn client_send(req: &Request) -> Result<Response> {
 
 #[allow(dead_code)] // The HashMap import is keyed for future commands.
 fn _hm_keep(_x: HashMap<u8, u8>) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zvariant::{OwnedValue, Value};
+
+    fn win(id: u64, wm_class: &str, title: &str, focused: bool) -> WindowDict {
+        let mut w = WindowDict::new();
+        w.insert("id".into(), OwnedValue::try_from(Value::U64(id)).unwrap());
+        w.insert("wm_class".into(), OwnedValue::try_from(Value::new(wm_class)).unwrap());
+        w.insert("app_id".into(), OwnedValue::try_from(Value::new("")).unwrap());
+        w.insert("title".into(), OwnedValue::try_from(Value::new(title)).unwrap());
+        w.insert("focused".into(), OwnedValue::try_from(Value::Bool(focused)).unwrap());
+        w
+    }
+
+    #[test]
+    fn match_is_case_insensitive_substring() {
+        let w = win(1, "dosbox-x", "DOSBox-X 2024", false);
+        assert!(window_matches(&w, "DOSBox"));
+        assert!(window_matches(&w, "2024"));
+        assert!(!window_matches(&w, "firefox"));
+    }
+}
