@@ -247,6 +247,41 @@ enum Cmd {
         #[arg(long)]
         delay: Option<u64>,
     },
+
+    /* ----- [ext]  accessibility (AT-SPI2) introspection ----- */
+
+    /// [ext] Dump a window's accessibility (AT-SPI2) tree — role, name,
+    /// and rect per UI element, indented by depth.  Lets you target
+    /// buttons/menus/fields by NAME instead of guessing pixels from a
+    /// screenshot.  Only works for apps that expose accessibility info
+    /// (GTK, Qt, Firefox, Chromium — not SDL/emulators).  WINDOW
+    /// resolves like `click-in`.  When the app's screen position is
+    /// verifiable (X11/XWayland apps), printed coords are frame-relative
+    /// and feed straight into `click-in`.
+    UiTree {
+        window: String,
+        /// Maximum tree depth to descend (default 40).
+        #[arg(long)]
+        depth: Option<u32>,
+        /// Include elements that are not currently SHOWING (popped-down
+        /// menu contents, hidden panes).
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// [ext] Search a window's accessibility tree for elements whose
+    /// name contains PATTERN (case-insensitive; hidden elements are
+    /// searched too).  Prints each match with a center point for
+    /// `click-in`.  Use --role to restrict by role name (e.g. "push
+    /// button", "menu item").
+    UiFind {
+        window: String,
+        pattern: String,
+        /// Exact role name to require (case-insensitive), e.g. "push
+        /// button".
+        #[arg(long)]
+        role: Option<String>,
+    },
 }
 
 pub(crate) fn button_code(name: &str) -> Result<i32> {
@@ -895,6 +930,12 @@ async fn main() -> Result<()> {
         }
         Cmd::TypeIn { window, text, delay } => {
             client_call(daemon::Request::TypeWindow { window, text, delay }).await
+        }
+        Cmd::UiTree { window, depth, all } => {
+            client_call(daemon::Request::UiTree { window, depth, all }).await
+        }
+        Cmd::UiFind { window, pattern, role } => {
+            client_call(daemon::Request::UiFind { window, pattern, role }).await
         }
     }
 }

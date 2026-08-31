@@ -146,6 +146,26 @@ pub enum Request {
         #[serde(default)]
         delay: Option<u64>,
     },
+    /// Dump a window's AT-SPI accessibility tree: role, name, and rect
+    /// per element.  `depth` limits recursion; `all` includes elements
+    /// not currently SHOWING (popped-down menus etc.).
+    UiTree {
+        window: String,
+        #[serde(default)]
+        depth: Option<u32>,
+        #[serde(default)]
+        all: bool,
+    },
+    /// Search a window's AT-SPI tree for elements whose name contains
+    /// `pattern` (case-insensitive; empty matches everything), optionally
+    /// restricted to a role.  Prints each match with a center point for
+    /// `click-in`.
+    UiFind {
+        window: String,
+        pattern: String,
+        #[serde(default)]
+        role: Option<String>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -766,6 +786,15 @@ async fn dispatch(state_arc: Arc<Mutex<DaemonState>>, req: Request) -> Result<Re
             drop(state);
             type_window(&state_arc, window, text, delay).await
         }
+        Request::UiTree { window, depth, all } => {
+            // Extension (window lookup) + a11y bus only; no portal state.
+            drop(state);
+            ui_tree(&window, depth, all).await
+        }
+        Request::UiFind { window, pattern, role } => {
+            drop(state);
+            ui_find(&window, &pattern, role.as_deref()).await
+        }
         Request::Key { name } => {
             let sym = crate::keysym_from_name(&name)
                 .ok_or_else(|| anyhow!("unknown keysym {name:?}"))?;
@@ -1335,6 +1364,419 @@ async fn dispatch_extension(req: Request) -> Result<Response> {
     }
 }
 
+/* ============================================================ */
+/*   AT-SPI2 (accessibility) dispatch                            */
+/*                                                              */
+/*   ui-tree / ui-find read another app's widget tree over the  */
+/*   dedicated accessibility bus (AT-SPI2).  GTK/Qt/Firefox/    */
+/*   Chromium expose trees; SDL/emulator/custom-toolkit apps    */
+/*   expose nothing.  Coordinates: AT-SPI "window" coords are   */
+/*   relative to the app's a11y toplevel; when the toplevel's   */
+/*   SCREEN extents are honest (X11/XWayland apps) we translate */
+/*   everything into OUR frame-relative space so the numbers    */
+/*   feed straight into click-in.                               */
+/* ============================================================ */
+
+const ATSPI_ROOT_DEST: &str = "org.a11y.atspi.Registry";
+const ATSPI_ROOT_PATH: &str = "/org/a11y/atspi/accessible/root";
+const ATSPI_IFACE_ACC: &str = "org.a11y.atspi.Accessible";
+const ATSPI_IFACE_COMP: &str = "org.a11y.atspi.Component";
+/// StateType bit in word 0 of GetState: element is currently rendered.
+const ATSPI_STATE_SHOWING: u32 = 1 << 25;
+/// GetExtents coordinate types.
+const ATSPI_COORD_SCREEN: u32 = 0;
+const ATSPI_COORD_WINDOW: u32 = 1;
+/// Hard cap on accessibles visited per walk — big apps (browsers)
+/// expose tens of thousands of nodes and each costs D-Bus round-trips.
+const UI_WALK_BUDGET: usize = 5000;
+const UI_DEFAULT_DEPTH: u32 = 40;
+
+#[derive(Clone, Debug)]
+struct AccRef {
+    dest: String,
+    path: zvariant::OwnedObjectPath,
+}
+
+/// Connect to the dedicated accessibility bus (its address comes from
+/// org.a11y.Bus on the session bus).
+async fn a11y_connection() -> Result<zbus::Connection> {
+    let session = zbus::Connection::session().await.context("session bus")?;
+    let reply = session
+        .call_method(
+            Some("org.a11y.Bus"), "/org/a11y/bus", Some("org.a11y.Bus"), "GetAddress", &(),
+        )
+        .await
+        .context("org.a11y.Bus.GetAddress — is the accessibility stack running?")?;
+    let addr: String = reply.body().deserialize()?;
+    zbus::connection::Builder::address(addr.as_str())?
+        .build()
+        .await
+        .with_context(|| format!("connect to accessibility bus at {addr}"))
+}
+
+async fn acc_children(conn: &zbus::Connection, r: &AccRef) -> Result<Vec<AccRef>> {
+    let reply = conn
+        .call_method(Some(r.dest.as_str()), &r.path, Some(ATSPI_IFACE_ACC), "GetChildren", &())
+        .await?;
+    let kids: Vec<(String, zvariant::OwnedObjectPath)> = reply.body().deserialize()?;
+    Ok(kids
+        .into_iter()
+        .filter(|(_, p)| p.as_str() != "/org/a11y/atspi/null")
+        .map(|(dest, path)| AccRef { dest, path })
+        .collect())
+}
+
+async fn acc_name(conn: &zbus::Connection, r: &AccRef) -> String {
+    let reply = conn
+        .call_method(
+            Some(r.dest.as_str()), &r.path,
+            Some("org.freedesktop.DBus.Properties"), "Get",
+            &(ATSPI_IFACE_ACC, "Name"),
+        )
+        .await;
+    match reply {
+        Ok(m) => m
+            .body()
+            .deserialize::<zvariant::OwnedValue>()
+            .ok()
+            .and_then(|v| String::try_from(v).ok())
+            .unwrap_or_default(),
+        Err(_) => String::new(),
+    }
+}
+
+async fn acc_role(conn: &zbus::Connection, r: &AccRef) -> String {
+    match conn
+        .call_method(Some(r.dest.as_str()), &r.path, Some(ATSPI_IFACE_ACC), "GetRoleName", &())
+        .await
+    {
+        Ok(m) => m.body().deserialize().unwrap_or_else(|_| "?".into()),
+        Err(_) => "?".into(),
+    }
+}
+
+/// Is the element currently rendered?  Errors default to true so a
+/// flaky app hides nothing.
+async fn acc_showing(conn: &zbus::Connection, r: &AccRef) -> bool {
+    match conn
+        .call_method(Some(r.dest.as_str()), &r.path, Some(ATSPI_IFACE_ACC), "GetState", &())
+        .await
+    {
+        Ok(m) => m
+            .body()
+            .deserialize::<Vec<u32>>()
+            .ok()
+            .and_then(|words| words.first().copied())
+            .map(|w| w & ATSPI_STATE_SHOWING != 0)
+            .unwrap_or(true),
+        Err(_) => true,
+    }
+}
+
+/// (x, y, w, h) in the requested AT-SPI coordinate space; None when the
+/// element has no Component interface (structural nodes).
+async fn acc_extents(conn: &zbus::Connection, r: &AccRef, coord: u32) -> Option<(i32, i32, i32, i32)> {
+    let m = conn
+        .call_method(Some(r.dest.as_str()), &r.path, Some(ATSPI_IFACE_COMP), "GetExtents", &(coord,))
+        .await
+        .ok()?;
+    m.body().deserialize::<((i32, i32, i32, i32),)>().ok().map(|(t,)| t)
+}
+
+async fn a11y_app_pid(conn: &zbus::Connection, dest: &str) -> Option<u32> {
+    let m = conn
+        .call_method(
+            Some("org.freedesktop.DBus"), "/org/freedesktop/DBus",
+            Some("org.freedesktop.DBus"), "GetConnectionUnixProcessID", &(dest,),
+        )
+        .await
+        .ok()?;
+    m.body().deserialize().ok()
+}
+
+/// Find the AT-SPI applications that could belong to an extension
+/// window dict, best match first.  Primary key is the pid; fallback is
+/// a name match against wm_class/app_id (flatpak apps sit behind
+/// xdg-dbus-proxy, so their bus pid is the proxy's, not the app's).
+/// Returns a list because one app can register several bus connections
+/// (86Box under flatpak registers two, only one of which exposes
+/// windows) — the caller keeps the first candidate with toplevels.
+async fn a11y_find_apps(conn: &zbus::Connection, win: &WindowDict) -> Result<Vec<AccRef>> {
+    let root = AccRef {
+        dest: ATSPI_ROOT_DEST.into(),
+        path: zvariant::OwnedObjectPath::try_from(ATSPI_ROOT_PATH)?,
+    };
+    let apps = acc_children(conn, &root).await.context("list AT-SPI applications")?;
+    let win_pid = dict_i64(win, "pid").ok();
+    let targets: Vec<String> = ["wm_class", "app_id"]
+        .iter()
+        .filter_map(|k| win.get(*k).map(|v| render_value(v).to_lowercase()))
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut by_pid = Vec::new();
+    let mut by_name = Vec::new();
+    let mut names = Vec::new();
+    for a in &apps {
+        if win_pid.is_some() && a11y_app_pid(conn, &a.dest).await == win_pid.map(|p| p as u32) {
+            by_pid.push(a.clone());
+            continue;
+        }
+        let name = acc_name(conn, a).await;
+        if name.is_empty() {
+            continue;
+        }
+        let ln = name.to_lowercase();
+        if targets.iter().any(|t| t.contains(&ln) || ln.contains(t.as_str())) {
+            by_name.push(a.clone());
+        } else {
+            names.push(name);
+        }
+    }
+    by_pid.extend(by_name);
+    if by_pid.is_empty() {
+        return Err(anyhow!(
+            "no AT-SPI application matches this window (pid {win_pid:?}) — the app \
+             probably doesn't expose accessibility info (SDL/emulator/custom-toolkit \
+             apps don't). Apps currently on the a11y bus: {}",
+            if names.is_empty() { "none".into() } else { names.join(", ") }
+        ));
+    }
+    Ok(by_pid)
+}
+
+/// Pick the a11y toplevel matching the extension window's title,
+/// trying each candidate app connection until one exposes windows.
+async fn a11y_find_toplevel(
+    conn: &zbus::Connection,
+    apps: &[AccRef],
+    title: &str,
+) -> Result<AccRef> {
+    let mut tops = Vec::new();
+    for app in apps {
+        tops = acc_children(conn, app).await.context("list application toplevels")?;
+        if !tops.is_empty() {
+            break;
+        }
+    }
+    match tops.len() {
+        0 => return Err(anyhow!("application exposes no windows on the a11y bus")),
+        1 => return Ok(tops[0].clone()),
+        _ => {}
+    }
+    let mut names = Vec::new();
+    for t in &tops {
+        let name = acc_name(conn, t).await;
+        if name == title {
+            return Ok(t.clone());
+        }
+        names.push(name);
+    }
+    // No exact title match: a single SHOWING toplevel is unambiguous.
+    let mut showing = Vec::new();
+    for t in &tops {
+        if acc_showing(conn, t).await {
+            showing.push(t.clone());
+        }
+    }
+    if showing.len() == 1 {
+        return Ok(showing.remove(0));
+    }
+    Err(anyhow!(
+        "none of the app's {} a11y toplevels matches title {title:?}: {names:?}",
+        tops.len()
+    ))
+}
+
+/// Offset of the a11y toplevel's origin within OUR frame rect, when the
+/// app's SCREEN coordinates are trustworthy (X11/XWayland apps report
+/// honest global coords; Wayland CSD apps report surface-relative junk,
+/// which lands outside the frame rect and yields None).
+async fn a11y_frame_offset(
+    conn: &zbus::Connection,
+    top: &AccRef,
+    win: &WindowDict,
+) -> Option<(i32, i32)> {
+    let (sx, sy, _, _) = acc_extents(conn, top, ATSPI_COORD_SCREEN).await?;
+    let fx = dict_i64(win, "frame_x").ok()? as i32;
+    let fy = dict_i64(win, "frame_y").ok()? as i32;
+    let fw = dict_i64(win, "frame_w").ok()? as i32;
+    let fh = dict_i64(win, "frame_h").ok()? as i32;
+    let (dx, dy) = (sx - fx, sy - fy);
+    if dx >= 0 && dy >= 0 && dx < fw && dy < fh { Some((dx, dy)) } else { None }
+}
+
+struct UiNode {
+    depth: usize,
+    role: String,
+    name: String,
+    rect: Option<(i32, i32, i32, i32)>,
+    showing: bool,
+}
+
+/// Depth-first walk of an a11y subtree in child order.  Returns the
+/// visited nodes plus whether the walk hit the node budget.  Skips (and
+/// doesn't descend into) non-SHOWING elements unless `include_hidden`.
+async fn a11y_walk(
+    conn: &zbus::Connection,
+    top: &AccRef,
+    max_depth: usize,
+    include_hidden: bool,
+) -> Result<(Vec<UiNode>, bool)> {
+    let mut out = Vec::new();
+    let mut stack = vec![(top.clone(), 0usize)];
+    let mut visited = 0usize;
+    let mut truncated = false;
+    while let Some((r, depth)) = stack.pop() {
+        visited += 1;
+        if visited > UI_WALK_BUDGET {
+            truncated = true;
+            break;
+        }
+        let showing = acc_showing(conn, &r).await;
+        if !showing && !include_hidden {
+            continue;
+        }
+        out.push(UiNode {
+            depth,
+            role: acc_role(conn, &r).await,
+            name: acc_name(conn, &r).await,
+            rect: acc_extents(conn, &r, ATSPI_COORD_WINDOW).await,
+            showing,
+        });
+        if depth < max_depth {
+            for k in acc_children(conn, &r).await.unwrap_or_default().into_iter().rev() {
+                stack.push((k, depth + 1));
+            }
+        }
+    }
+    Ok((out, truncated))
+}
+
+/// Shared front half of ui-tree/ui-find: resolve the window through the
+/// extension, find its a11y app + toplevel, and work out the coordinate
+/// translation.  Returns (connection, toplevel, window id, frame offset).
+async fn ui_query_common(sel: &str) -> Result<(zbus::Connection, AccRef, i64, Option<(i32, i32)>)> {
+    let proxy = ext_proxy().await?;
+    let windows: Vec<WindowDict> = proxy.call("GetWindows", &()).await.map_err(|e| {
+        anyhow!("GetWindows on com.mxshift.WaylandAgent failed: {e}\n{EXT_NOT_FOUND_HINT}")
+    })?;
+    let win = resolve_window_selector(windows, sel)?;
+    let id = dict_i64(&win, "id")?;
+    let title = win.get("title").map(render_value).unwrap_or_default();
+
+    let conn = a11y_connection().await?;
+    let apps = a11y_find_apps(&conn, &win).await?;
+    let top = a11y_find_toplevel(&conn, &apps, &title).await?;
+    let off = a11y_frame_offset(&conn, &top, &win).await;
+    Ok((conn, top, id, off))
+}
+
+/// Header line telling the caller what space the printed coordinates
+/// are in, and how to click them.
+fn ui_coord_header(id: i64, off: Option<(i32, i32)>) -> String {
+    match off {
+        Some(_) => format!(
+            "coords are relative to window {id}'s frame — click with \
+             `click-in {id} <x> <y>`"
+        ),
+        None => format!(
+            "coords are relative to the app's a11y toplevel (its screen \
+             position is unverifiable — typical for Wayland-native apps); \
+             for CSD apps this usually equals window {id}'s frame space \
+             (`click-in {id} <x> <y>`) — verify against a screenshot"
+        ),
+    }
+}
+
+fn ui_translate(rect: (i32, i32, i32, i32), off: Option<(i32, i32)>) -> (i32, i32, i32, i32) {
+    let (dx, dy) = off.unwrap_or((0, 0));
+    (rect.0 + dx, rect.1 + dy, rect.2, rect.3)
+}
+
+pub(crate) async fn ui_tree(sel: &str, depth: Option<u32>, all: bool) -> Result<Response> {
+    let (conn, top, id, off) = ui_query_common(sel).await?;
+    let max_depth = depth.unwrap_or(UI_DEFAULT_DEPTH) as usize;
+    let (nodes, truncated) = a11y_walk(&conn, &top, max_depth, all).await?;
+
+    let mut out = ui_coord_header(id, off);
+    out.push('\n');
+    for n in &nodes {
+        out.push_str(&"  ".repeat(n.depth));
+        out.push_str(&n.role);
+        if !n.name.is_empty() {
+            out.push_str(&format!(" {:?}", n.name));
+        }
+        // Coordinates of non-SHOWING elements are meaningless (Qt
+        // reports popped-down menus at garbage positions) — print the
+        // tag, not numbers an agent might click.
+        if n.showing {
+            if let Some(r) = n.rect {
+                let (x, y, w, h) = ui_translate(r, off);
+                out.push_str(&format!(" ({x},{y} {w}x{h})"));
+            }
+        } else {
+            out.push_str(" [hidden]");
+        }
+        out.push('\n');
+    }
+    if truncated {
+        out.push_str(&format!(
+            "... truncated at {UI_WALK_BUDGET} elements — use --depth or ui-find\n"
+        ));
+    }
+    Ok(Response::ok_detail(out.trim_end().to_string()))
+}
+
+pub(crate) async fn ui_find(sel: &str, pattern: &str, role: Option<&str>) -> Result<Response> {
+    let (conn, top, id, off) = ui_query_common(sel).await?;
+    // Search everything, including popped-down menus — knowing a hidden
+    // element exists is the point of searching.
+    let (nodes, truncated) = a11y_walk(&conn, &top, UI_DEFAULT_DEPTH as usize, true).await?;
+
+    let needle = pattern.to_lowercase();
+    let role_needle = role.map(|r| r.to_lowercase());
+    let hits: Vec<&UiNode> = nodes
+        .iter()
+        .filter(|n| n.name.to_lowercase().contains(&needle))
+        .filter(|n| role_needle.as_deref().is_none_or(|r| n.role.to_lowercase() == r))
+        .collect();
+
+    if hits.is_empty() {
+        return Err(anyhow!(
+            "no UI element matched name {pattern:?}{} in window {id}{} — run \
+             `ui-tree {id}` to see what the app exposes",
+            role.map(|r| format!(" with role {r:?}")).unwrap_or_default(),
+            if truncated { " (walk truncated — the tree is very large)" } else { "" },
+        ));
+    }
+
+    let mut out = ui_coord_header(id, off);
+    out.push('\n');
+    for n in hits {
+        out.push_str(&n.role);
+        out.push_str(&format!(" {:?}", n.name));
+        // See ui_tree: hidden elements get the tag, not garbage coords.
+        if n.showing {
+            if let Some(r) = n.rect {
+                let (x, y, w, h) = ui_translate(r, off);
+                out.push_str(&format!(
+                    " center=({},{}) rect=({x},{y} {w}x{h})",
+                    x + w / 2,
+                    y + h / 2
+                ));
+            }
+        } else {
+            out.push_str(" [hidden — open its menu/pane first, then re-run]");
+        }
+        out.push('\n');
+    }
+    if truncated {
+        out.push_str("... walk truncated — matches beyond the budget were not seen\n");
+    }
+    Ok(Response::ok_detail(out.trim_end().to_string()))
+}
+
 /// Connect to the daemon and send one request, return its response.
 pub async fn client_send(req: &Request) -> Result<Response> {
     let sock = socket_path()?;
@@ -1407,6 +1849,33 @@ mod tests {
     fn unmatched_selector_errors() {
         let ws = vec![win(1, "term", "a", false)];
         assert!(resolve_window_selector(ws, "nope").is_err());
+    }
+
+    /// Live end-to-end test against the running gnome-shell extension
+    /// and accessibility bus — run explicitly with
+    /// `cargo test ui_tree_live -- --ignored --nocapture`.
+    /// Needs at least one AT-SPI-exposing app with an open window.
+    #[tokio::test]
+    #[ignore]
+    async fn ui_tree_live() {
+        let resp = ui_tree("86box", Some(6), false).await;
+        match resp {
+            Ok(Response::Ok { detail: Some(d), .. }) => {
+                println!("{d}");
+                assert!(d.lines().count() > 1, "expected at least one tree node");
+            }
+            other => panic!("ui_tree failed: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn ui_find_live() {
+        let resp = ui_find("86box", "", None).await;
+        match resp {
+            Ok(Response::Ok { detail: Some(d), .. }) => println!("{d}"),
+            other => panic!("ui_find failed: {other:?}"),
+        }
     }
 
     #[test]
