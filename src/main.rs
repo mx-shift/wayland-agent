@@ -202,6 +202,28 @@ enum Cmd {
         #[arg(long)]
         all: bool,
     },
+
+    /// [ext+portal] Focus a window, move to coordinates RELATIVE to
+    /// that window's origin, and click — one command, no absolute
+    /// coordinate bookkeeping.  WINDOW is a numeric id (from
+    /// `windows`/`find-window`) or a find-window pattern that must
+    /// match exactly one window.  X/Y are measured from the window's
+    /// visible (frame) top-left corner in global-logical units — the
+    /// same units `windows` reports rects in (divide screenshot pixels
+    /// by the monitor scale on HiDPI).  Offsets outside the window are
+    /// rejected.  Waits for focus to land before clicking, so a
+    /// following `key`/`type` goes to the same window.
+    ClickIn {
+        window: String,
+        x: f64,
+        y: f64,
+        #[arg(long, default_value = "left")]
+        button: String,
+        /// Measure X/Y from the client-area origin (buffer rect)
+        /// instead of the visible frame origin.
+        #[arg(long)]
+        client: bool,
+    },
 }
 
 pub(crate) fn button_code(name: &str) -> Result<i32> {
@@ -844,6 +866,9 @@ async fn main() -> Result<()> {
         Cmd::Monitors => client_call(daemon::Request::Monitors).await,
         Cmd::FindWindow { pattern, all } => {
             client_call(daemon::Request::FindWindow { pattern, all }).await
+        }
+        Cmd::ClickIn { window, x, y, button, client } => {
+            client_call(daemon::Request::ClickWindow { window, x, y, button, client }).await
         }
     }
 }

@@ -123,6 +123,19 @@ pub enum Request {
         #[serde(default)]
         all: bool,
     },
+    /// Focus a window, move to coordinates relative to its origin, and
+    /// click — the one-shot "drive this window" primitive.  `window` is
+    /// a numeric id or a find-window pattern that must match exactly
+    /// one window.  `x`/`y` are global-logical units measured from the
+    /// window's frame origin (or client origin when `client` is set).
+    ClickWindow {
+        window: String,
+        x: f64,
+        y: f64,
+        button: String,
+        #[serde(default)]
+        client: bool,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -731,6 +744,13 @@ async fn dispatch(state_arc: Arc<Mutex<DaemonState>>, req: Request) -> Result<Re
             drop(state);
             dispatch_extension(req).await
         }
+        Request::ClickWindow { window, x, y, button, client } => {
+            // Needs the extension (window lookup + focus) AND the portal
+            // (pointer).  Drop the state lock for the D-Bus leg; the
+            // handler re-locks for the pointer leg.
+            drop(state);
+            click_window(&state_arc, window, x, y, button, client).await
+        }
         Request::Key { name } => {
             let sym = crate::keysym_from_name(&name)
                 .ok_or_else(|| anyhow!("unknown keysym {name:?}"))?;
@@ -1066,6 +1086,22 @@ fn window_matches(w: &WindowDict, pattern: &str) -> bool {
     })
 }
 
+fn dict_i64(w: &WindowDict, key: &str) -> Result<i64> {
+    use zvariant::Value;
+    let v = w.get(key).ok_or_else(|| anyhow!("window dict missing {key:?}"))?;
+    Ok(match &**v {
+        Value::U64(n) => *n as i64,
+        Value::U32(n) => *n as i64,
+        Value::I64(n) => *n,
+        Value::I32(n) => *n as i64,
+        other => return Err(anyhow!("window dict {key:?} is not an integer: {other:?}")),
+    })
+}
+
+fn dict_bool(w: &WindowDict, key: &str) -> bool {
+    matches!(w.get(key).map(|v| &**v), Some(zvariant::Value::Bool(true)))
+}
+
 /// One line per window — enough for a caller to pick an id.
 fn summarize_windows(windows: &[WindowDict]) -> String {
     windows
@@ -1083,6 +1119,107 @@ fn summarize_windows(windows: &[WindowDict]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Resolve a `click-in` window selector against the current window
+/// list: a string that parses as a u64 AND names an existing window id
+/// wins; otherwise it's a find-window pattern that must match exactly
+/// one window — several matches is the same loud error find-window
+/// gives, so callers disambiguate instead of clicking into the wrong
+/// window.
+fn resolve_window_selector(windows: Vec<WindowDict>, sel: &str) -> Result<WindowDict> {
+    if let Ok(id) = sel.parse::<i64>() {
+        if let Some(w) = windows
+            .iter()
+            .find(|w| dict_i64(w, "id").map(|i| i == id).unwrap_or(false))
+        {
+            return Ok(w.clone());
+        }
+    }
+    let mut matches: Vec<WindowDict> =
+        windows.into_iter().filter(|w| window_matches(w, sel)).collect();
+    match matches.len() {
+        0 => Err(anyhow!("no window matched {sel:?}")),
+        1 => Ok(matches.remove(0)),
+        n => Err(anyhow!(
+            "{n} windows match {sel:?} — refine the pattern or use a window id:\n{}",
+            summarize_windows(&matches)
+        )),
+    }
+}
+
+/// The `click-in` implementation: resolve the window, focus it if it
+/// isn't already (waiting for focus to actually land so the click
+/// doesn't race the raise), re-read its geometry, translate the
+/// window-relative offset to a global-logical point, and click.
+async fn click_window(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    sel: String,
+    x: f64,
+    y: f64,
+    button: String,
+    client: bool,
+) -> Result<Response> {
+    let code = crate::button_code(&button)?;
+    let proxy = ext_proxy().await?;
+    let windows: Vec<WindowDict> = proxy.call("GetWindows", &()).await.map_err(|e| {
+        anyhow!("GetWindows on com.mxshift.WaylandAgent failed: {e}\n{EXT_NOT_FOUND_HINT}")
+    })?;
+    let mut win = resolve_window_selector(windows, &sel)?;
+    let id = dict_i64(&win, "id")? as u64;
+
+    if !dict_bool(&win, "focused") {
+        let _: () = proxy.call("FocusWindow", &(id,)).await.map_err(|e| {
+            anyhow!("FocusWindow on com.mxshift.WaylandAgent failed: {e}\n{EXT_NOT_FOUND_HINT}")
+        })?;
+        // Activation is asynchronous in mutter; poll until the window
+        // reports focus (also picks up post-raise/unminimize geometry).
+        // Some windows never take keyboard focus — proceed after the
+        // deadline rather than failing the click.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            win = proxy.call("GetWindow", &(id,)).await.map_err(|e| {
+                anyhow!("GetWindow on com.mxshift.WaylandAgent failed after focus: {e}")
+            })?;
+            if dict_bool(&win, "focused") || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+    }
+
+    let (prefix, label) = if client { ("client", "client area") } else { ("frame", "frame") };
+    let ox = dict_i64(&win, &format!("{prefix}_x"))? as f64;
+    let oy = dict_i64(&win, &format!("{prefix}_y"))? as f64;
+    let w = dict_i64(&win, &format!("{prefix}_w"))? as f64;
+    let h = dict_i64(&win, &format!("{prefix}_h"))? as f64;
+    if x < 0.0 || y < 0.0 || x >= w || y >= h {
+        return Err(anyhow!(
+            "offset ({x:.0}, {y:.0}) is outside window {id}'s {label} \
+             ({w:.0}x{h:.0}). click-in coordinates are RELATIVE to the \
+             window's origin, not global screen coordinates."
+        ));
+    }
+    let (gx, gy) = (ox + x, oy + y);
+
+    let state = state_arc.lock().await;
+    let (node, fx, fy) = resolve_global(&state.streams, gx, gy)?;
+    state.rd.notify_pointer_motion_absolute(
+        &state.session, node, fx, fy,
+        NotifyPointerMotionAbsoluteOptions::default(),
+    ).await?;
+    state.rd.notify_pointer_button(
+        &state.session, code, KeyState::Pressed,
+        NotifyPointerButtonOptions::default(),
+    ).await?;
+    state.rd.notify_pointer_button(
+        &state.session, code, KeyState::Released,
+        NotifyPointerButtonOptions::default(),
+    ).await?;
+    Ok(Response::ok_detail(format!(
+        "clicked {button} at ({x:.0}, {y:.0}) relative to window {id}'s {label} \
+         (global {gx:.0}, {gy:.0})"
+    )))
 }
 
 async fn dispatch_extension(req: Request) -> Result<Response> {
@@ -1135,7 +1272,8 @@ async fn dispatch_extension(req: Request) -> Result<Response> {
                 _ if all => Ok(Response::ok_detail(fmt_dicts("match", &matches))),
                 n => Err(anyhow!(
                     "{n} windows match {pattern:?} — refine the pattern, target one \
-                     by id (`window <id>`), or pass --all to list every match:\n{}",
+                     by id (`window <id>` / `click-in <id> ...`), or pass --all to \
+                     list every match:\n{}",
                     summarize_windows(&matches)
                 )),
             }
@@ -1186,5 +1324,44 @@ mod tests {
         assert!(window_matches(&w, "DOSBox"));
         assert!(window_matches(&w, "2024"));
         assert!(!window_matches(&w, "firefox"));
+    }
+
+    #[test]
+    fn selector_prefers_exact_id() {
+        // "2" is both a valid id and a substring of the other title.
+        let ws = vec![win(1, "term", "window 2", false), win(2, "editor", "e", false)];
+        let hit = resolve_window_selector(ws, "2").unwrap();
+        assert_eq!(dict_i64(&hit, "id").unwrap(), 2);
+    }
+
+    #[test]
+    fn selector_falls_back_to_pattern_when_id_unknown() {
+        let ws = vec![win(1, "term-99", "t", false)];
+        let hit = resolve_window_selector(ws, "99").unwrap();
+        assert_eq!(dict_i64(&hit, "id").unwrap(), 1);
+    }
+
+    #[test]
+    fn ambiguous_selector_errors_with_candidates() {
+        let ws = vec![win(1, "term", "a", true), win(2, "term", "b", false)];
+        let err = resolve_window_selector(ws, "term").unwrap_err().to_string();
+        assert!(err.contains("2 windows match"), "{err}");
+        assert!(err.contains("id=1"), "{err}");
+        assert!(err.contains("id=2"), "{err}");
+    }
+
+    #[test]
+    fn unmatched_selector_errors() {
+        let ws = vec![win(1, "term", "a", false)];
+        assert!(resolve_window_selector(ws, "nope").is_err());
+    }
+
+    #[test]
+    fn dict_accessors() {
+        let w = win(7, "x", "y", true);
+        assert_eq!(dict_i64(&w, "id").unwrap(), 7);
+        assert!(dict_bool(&w, "focused"));
+        assert!(!dict_bool(&w, "missing"));
+        assert!(dict_i64(&w, "missing").is_err());
     }
 }
