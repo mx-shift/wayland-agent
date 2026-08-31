@@ -85,8 +85,15 @@ enum Cmd {
 
     /// [portal] Type a UTF-8 string — each character becomes a
     /// press+release.  No way to compose modifier+key inside a string;
-    /// use `key-chord` for combos.
-    Type { text: String },
+    /// use `key-chord` for combos.  `--delay MS` waits after each character
+    /// (omit for full speed); set it for slow consumers like DOSBox, whose
+    /// emulated keyboard drops characters typed too fast.
+    Type {
+        text: String,
+        /// Milliseconds to wait after each character; omit for full speed.
+        #[arg(long)]
+        delay: Option<u64>,
+    },
 
     /* ----- [portal]  pointer ----- */
 
@@ -843,7 +850,7 @@ async fn main() -> Result<()> {
         Cmd::KeyCode { code } => client_call(daemon::Request::KeyCode { code }).await,
         Cmd::KeyDown { name } => client_call(daemon::Request::KeyDown { name }).await,
         Cmd::KeyUp { name } => client_call(daemon::Request::KeyUp { name }).await,
-        Cmd::Type { text } => client_call(daemon::Request::Type { text }).await,
+        Cmd::Type { text, delay } => client_call(daemon::Request::Type { text, delay }).await,
         Cmd::Move { x, y, stream } => client_call(daemon::Request::Move { x, y, stream }).await,
         Cmd::MoveGlobal { x, y } => client_call(daemon::Request::MoveGlobal { x, y }).await,
         Cmd::Click { button } => client_call(daemon::Request::Click { button }).await,

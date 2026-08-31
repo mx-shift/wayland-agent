@@ -75,8 +75,9 @@ pub enum Request {
     KeyDown { name: String },
     /// Release a keysym previously held via KeyDown.
     KeyUp { name: String },
-    /// Type a UTF-8 string by mapping each char to its keysym.
-    Type { text: String },
+    /// Type a UTF-8 string by mapping each char to its keysym.  `delay`
+    /// is milliseconds to wait after each character; None = as fast as possible.
+    Type { text: String, delay: Option<u64> },
     /// Absolute pointer move on the given stream.  `x`/`y` are in
     /// screenshot-pixel space of that stream (what you read off the
     /// PNG) — they map 1:1 to the portal's pointer coordinates.
@@ -832,7 +833,7 @@ async fn dispatch(state_arc: Arc<Mutex<DaemonState>>, req: Request) -> Result<Re
             ).await?;
             Ok(Response::ok())
         }
-        Request::Type { text } => {
+        Request::Type { text, delay } => {
             for ch in text.chars() {
                 let sym = crate::keysym_for_char(ch)
                     .ok_or_else(|| anyhow!("char {ch:?} has no mapped keysym"))?;
@@ -844,6 +845,11 @@ async fn dispatch(state_arc: Arc<Mutex<DaemonState>>, req: Request) -> Result<Re
                     &state.session, sym, KeyState::Released,
                     NotifyKeyboardKeysymOptions::default(),
                 ).await?;
+                // Pace for slow consumers (e.g. DOSBox's emulated keyboard,
+                // which drops characters typed faster than it can drain).
+                if let Some(ms) = delay {
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                }
             }
             Ok(Response::ok())
         }
