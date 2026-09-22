@@ -77,7 +77,13 @@ pub enum Request {
     KeyUp { name: String },
     /// Type a UTF-8 string by mapping each char to its keysym.  `delay`
     /// is milliseconds to wait after each character; None = as fast as possible.
-    Type { text: String, delay: Option<u64> },
+    /// `hold` is milliseconds each key stays down; None = released at once.
+    Type {
+        text: String,
+        delay: Option<u64>,
+        #[serde(default)]
+        hold: Option<u64>,
+    },
     /// Absolute pointer move on the given stream.  `x`/`y` are in
     /// screenshot-pixel space of that stream (what you read off the
     /// PNG) — they map 1:1 to the portal's pointer coordinates.
@@ -151,6 +157,8 @@ pub enum Request {
         text: String,
         #[serde(default)]
         delay: Option<u64>,
+        #[serde(default)]
+        hold: Option<u64>,
     },
     /// Dump a window's AT-SPI accessibility tree: role, name, and rect
     /// per element.  `depth` limits recursion; `all` includes elements
@@ -787,10 +795,10 @@ async fn dispatch(state_arc: Arc<Mutex<DaemonState>>, req: Request) -> Result<Re
             drop(state);
             click_window(&state_arc, window, x, y, button, client).await
         }
-        Request::TypeWindow { window, text, delay } => {
+        Request::TypeWindow { window, text, delay, hold } => {
             // Same extension+portal split as ClickWindow.
             drop(state);
-            type_window(&state_arc, window, text, delay).await
+            type_window(&state_arc, window, text, delay, hold).await
         }
         Request::UiTree { window, depth, all } => {
             // Extension (window lookup) + a11y bus only; no portal state.
@@ -882,8 +890,8 @@ async fn dispatch(state_arc: Arc<Mutex<DaemonState>>, req: Request) -> Result<Re
             ).await?;
             Ok(Response::ok())
         }
-        Request::Type { text, delay } => {
-            type_text(&state, &text, delay).await?;
+        Request::Type { text, delay, hold } => {
+            type_text(&state, &text, delay, hold).await?;
             Ok(Response::ok())
         }
         Request::Move { x, y, stream } => {
@@ -1278,7 +1286,15 @@ async fn click_window(
 /// press+release per character.  `delay` is milliseconds to wait after
 /// each character — pacing for slow consumers (e.g. DOSBox's emulated
 /// keyboard, which drops characters typed faster than it can drain).
-async fn type_text(state: &DaemonState, text: &str, delay: Option<u64>) -> Result<()> {
+/// `hold` is milliseconds each key stays down, for emulators that scan
+/// a keyboard matrix (VICE) and miss a key pressed and released between
+/// two scans.
+async fn type_text(
+    state: &DaemonState,
+    text: &str,
+    delay: Option<u64>,
+    hold: Option<u64>,
+) -> Result<()> {
     for ch in text.chars() {
         let sym = crate::keysym_for_char(ch)
             .ok_or_else(|| anyhow!("char {ch:?} has no mapped keysym"))?;
@@ -1286,6 +1302,9 @@ async fn type_text(state: &DaemonState, text: &str, delay: Option<u64>) -> Resul
             &state.session, sym, KeyState::Pressed,
             NotifyKeyboardKeysymOptions::default(),
         ).await?;
+        if let Some(ms) = hold {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        }
         state.rd.notify_keyboard_keysym(
             &state.session, sym, KeyState::Released,
             NotifyKeyboardKeysymOptions::default(),
@@ -1305,13 +1324,14 @@ async fn type_window(
     sel: String,
     text: String,
     delay: Option<u64>,
+    hold: Option<u64>,
 ) -> Result<Response> {
     let win = resolve_and_focus(&sel).await?;
     let id = dict_i64(&win, "id")?;
     let nchars = text.chars().count();
 
     let state = state_arc.lock().await;
-    type_text(&state, &text, delay).await?;
+    type_text(&state, &text, delay, hold).await?;
     Ok(Response::ok_detail(format!(
         "typed {nchars} character(s) into window {id}"
     )))

@@ -87,12 +87,17 @@ enum Cmd {
     /// press+release.  No way to compose modifier+key inside a string;
     /// use `key-chord` for combos.  `--delay MS` waits after each character
     /// (omit for full speed); set it for slow consumers like DOSBox, whose
-    /// emulated keyboard drops characters typed too fast.
+    /// emulated keyboard drops characters typed too fast.  `--hold MS`
+    /// keeps each key down that long, for emulators that scan a keyboard
+    /// matrix (VICE) and miss a key pressed and released between scans.
     Type {
         text: String,
         /// Milliseconds to wait after each character; omit for full speed.
         #[arg(long)]
         delay: Option<u64>,
+        /// Milliseconds each key stays down; omit to release it at once.
+        #[arg(long)]
+        hold: Option<u64>,
     },
 
     /* ----- [portal]  pointer ----- */
@@ -255,6 +260,9 @@ enum Cmd {
         /// speed.  Set ~20-30 for DOSBox's emulated keyboard.
         #[arg(long)]
         delay: Option<u64>,
+        /// Milliseconds each key stays down; omit to release it at once.
+        #[arg(long)]
+        hold: Option<u64>,
     },
 
     /* ----- [ext]  accessibility (AT-SPI2) introspection ----- */
@@ -910,7 +918,9 @@ async fn main() -> Result<()> {
         Cmd::KeyCode { code } => client_call(daemon::Request::KeyCode { code }).await,
         Cmd::KeyDown { name } => client_call(daemon::Request::KeyDown { name }).await,
         Cmd::KeyUp { name } => client_call(daemon::Request::KeyUp { name }).await,
-        Cmd::Type { text, delay } => client_call(daemon::Request::Type { text, delay }).await,
+        Cmd::Type { text, delay, hold } => {
+            client_call(daemon::Request::Type { text, delay, hold }).await
+        }
         Cmd::Move { x, y, stream } => client_call(daemon::Request::Move { x, y, stream }).await,
         Cmd::MoveGlobal { x, y } => client_call(daemon::Request::MoveGlobal { x, y }).await,
         Cmd::MoveRel { dx, dy } => client_call(daemon::Request::MoveRel { dx, dy }).await,
@@ -938,8 +948,8 @@ async fn main() -> Result<()> {
         Cmd::ClickIn { window, x, y, button, client } => {
             client_call(daemon::Request::ClickWindow { window, x, y, button, client }).await
         }
-        Cmd::TypeIn { window, text, delay } => {
-            client_call(daemon::Request::TypeWindow { window, text, delay }).await
+        Cmd::TypeIn { window, text, delay, hold } => {
+            client_call(daemon::Request::TypeWindow { window, text, delay, hold }).await
         }
         Cmd::UiTree { window, depth, all } => {
             client_call(daemon::Request::UiTree { window, depth, all }).await
