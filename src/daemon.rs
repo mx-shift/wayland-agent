@@ -37,7 +37,7 @@ use ashpd::desktop::{
     remote_desktop::{
         DeviceType, KeyState, NotifyKeyboardKeycodeOptions, NotifyKeyboardKeysymOptions,
         NotifyPointerButtonOptions, NotifyPointerMotionAbsoluteOptions,
-        RemoteDesktop, SelectDevicesOptions, StartOptions,
+        NotifyPointerMotionOptions, RemoteDesktop, SelectDevicesOptions, StartOptions,
     },
     screencast::{
         CursorMode, OpenPipeWireRemoteOptions, Screencast, SelectSourcesOptions, SourceType,
@@ -94,6 +94,12 @@ pub enum Request {
     /// scales the offset up to the stream's physical frame space (what
     /// the portal expects).
     MoveGlobal { x: f64, y: f64 },
+    /// RELATIVE pointer motion (`NotifyPointerMotion`, dx/dy in logical
+    /// pixels).  Absolute moves are useless once an app holds a pointer
+    /// lock (86Box with the guest mouse captured, games): mutter pins
+    /// the pointer and hands the app relative deltas, and an absolute
+    /// position update produces none.  This sends the delta directly.
+    MoveRel { dx: f64, dy: f64 },
     /// Move (global logical coords) + press + release.
     ClickAtGlobal { x: f64, y: f64, button: String },
     /// Capture one frame per stream. Writes PNGs to the supplied
@@ -897,6 +903,13 @@ async fn dispatch(state_arc: Arc<Mutex<DaemonState>>, req: Request) -> Result<Re
             state.rd.notify_pointer_motion_absolute(
                 &state.session, node, lx, ly,
                 NotifyPointerMotionAbsoluteOptions::default(),
+            ).await?;
+            Ok(Response::ok())
+        }
+        Request::MoveRel { dx, dy } => {
+            state.rd.notify_pointer_motion(
+                &state.session, dx, dy,
+                NotifyPointerMotionOptions::default(),
             ).await?;
             Ok(Response::ok())
         }

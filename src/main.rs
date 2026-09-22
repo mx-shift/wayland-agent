@@ -114,6 +114,15 @@ enum Cmd {
     /// you; no manual offset math, no scaling.
     MoveGlobal { x: f64, y: f64 },
 
+    /// [portal] Move the pointer by a RELATIVE delta (dx, dy) in logical
+    /// pixels — the portal's `NotifyPointerMotion`.  Use this when the
+    /// focused app holds a pointer lock (86Box with the guest mouse
+    /// captured, MartyPC, games): the compositor pins the pointer and
+    /// feeds the app relative deltas, so `move`/`move-global` produce no
+    /// motion there at all.  Guest mice are relative devices too, so
+    /// steer by deltas and confirm with a `screenshot`.
+    MoveRel { dx: f64, dy: f64 },
+
     /// [portal] Press+release a pointer button at the current
     /// position.
     Click {
@@ -904,6 +913,7 @@ async fn main() -> Result<()> {
         Cmd::Type { text, delay } => client_call(daemon::Request::Type { text, delay }).await,
         Cmd::Move { x, y, stream } => client_call(daemon::Request::Move { x, y, stream }).await,
         Cmd::MoveGlobal { x, y } => client_call(daemon::Request::MoveGlobal { x, y }).await,
+        Cmd::MoveRel { dx, dy } => client_call(daemon::Request::MoveRel { dx, dy }).await,
         Cmd::Click { button } => client_call(daemon::Request::Click { button }).await,
         Cmd::ButtonDown { button } => {
             client_call(daemon::Request::ButtonDown { button }).await
