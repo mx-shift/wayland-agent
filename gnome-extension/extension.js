@@ -42,11 +42,23 @@
 //
 // All ids are Meta.Window.get_id() — a stable uint64 valid for the
 // window's lifetime.
+//
+// Quick Settings toggle:
+//
+//   Adds a "Wayland Agent" toggle to the top-right Quick Settings menu
+//   that starts/stops the daemon's systemd user unit
+//   (wayland-agent.service, see service.js).  Its subtitle tracks the
+//   unit: On / Waiting for consent / Off / Failed / Not installed.
 
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
+import GObject from 'gi://GObject';
 import Meta from 'gi://Meta';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import {QuickToggle, SystemIndicator} from 'resource:///org/gnome/shell/ui/quickSettings.js';
+
+import {AgentService} from './service.js';
 
 const BUS_NAME = 'com.mxshift.WaylandAgent';
 const OBJECT_PATH = '/com/mxshift/WaylandAgent';
@@ -181,10 +193,63 @@ function findWindowById(id) {
     return null;
 }
 
+/* ---------- Quick Settings toggle ---------- */
+
+const SUBTITLES = {
+    missing:  'Not installed',
+    off:      'Off',
+    failed:   'Failed',
+    starting: 'Waiting for consent',
+    on:       'On',
+    stopping: 'Stopping',
+};
+
+const AgentToggle = GObject.registerClass(
+class AgentToggle extends QuickToggle {
+    constructor(service) {
+        super({
+            title: 'Wayland Agent',
+            iconName: 'preferences-desktop-remote-desktop-symbolic',
+        });
+        this._service = service;
+        this._stateId = service.connect('notify::state', () => this._sync());
+        this.connect('clicked', () => {
+            const op = this._service.active ? this._service.stop() : this._service.start();
+            op.catch(e => console.warn(`wayland-agent: toggle failed: ${e.message}`));
+        });
+        this.connect('destroy', () => service.disconnect(this._stateId));
+        this._sync();
+    }
+
+    _sync() {
+        const state = this._service.state;
+        this.checked = this._service.active;
+        this.subtitle = SUBTITLES[state];
+        this.reactive = state !== 'missing' && state !== 'stopping';
+    }
+});
+
+const AgentIndicator = GObject.registerClass(
+class AgentIndicator extends SystemIndicator {
+    constructor(service) {
+        super();
+        this.quickSettingsItems.push(new AgentToggle(service));
+    }
+
+    destroy() {
+        this.quickSettingsItems.forEach(item => item.destroy());
+        super.destroy();
+    }
+});
+
 /* ---------- Extension class ---------- */
 
 export default class WaylandAgentExtension extends Extension {
     enable() {
+        this._service = new AgentService();
+        this._indicator = new AgentIndicator(this._service);
+        Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator);
+
         this._dbus = Gio.DBusExportedObject.wrapJSObject(IFACE_XML, this);
         this._dbus.export(Gio.DBus.session, OBJECT_PATH);
 
@@ -219,6 +284,11 @@ export default class WaylandAgentExtension extends Extension {
     }
 
     disable() {
+        this._indicator?.destroy();
+        this._indicator = null;
+        this._service?.destroy();
+        this._service = null;
+
         if (this._sigCreated) global.display.disconnect(this._sigCreated);
         if (this._sigFocus) global.display.disconnect(this._sigFocus);
         this._sigCreated = null;

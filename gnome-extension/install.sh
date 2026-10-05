@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# Install + enable the wayland-agent gnome-shell extension.
+# Install + enable the wayland-agent gnome-shell extension, plus the
+# systemd user unit its Quick Settings toggle controls.
 #
-# Drops metadata.json + extension.js into the per-user extension
-# directory, then asks gnome-extensions to enable the UUID.  On a
+# Drops metadata.json + *.js into the per-user extension directory,
+# then asks gnome-extensions to enable the UUID.  Installs
+# wayland-agent.service (pointing at this checkout's release binary)
+# but leaves it off: the daemon only runs while switched on from the
+# Quick Settings toggle.  On a
 # Wayland session enabling a new extension requires gnome-shell to
 # reload — log out and back in.  (On X11 you can do Alt+F2 'r' Enter,
 # but Wayland forbids hot-reload, no way around it.)
@@ -12,6 +16,8 @@ set -eu
 UUID="wayland-agent@mxshift.com"
 SRC="$(cd "$(dirname "$0")" && pwd)"
 DEST="${HOME}/.local/share/gnome-shell/extensions/${UUID}"
+BIN="$(cd "$SRC/.." && pwd)/target/release/wayland-agent"
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 
 if [[ ! -f "$SRC/metadata.json" || ! -f "$SRC/extension.js" ]]; then
     echo "ERROR: install.sh expects to live next to metadata.json + extension.js" >&2
@@ -21,7 +27,18 @@ fi
 mkdir -p "$DEST"
 cp -f "$SRC/metadata.json" "$DEST/"
 cp -f "$SRC/extension.js"  "$DEST/"
+cp -f "$SRC/service.js"    "$DEST/"
 echo "Installed extension files into $DEST"
+
+if [[ ! -x "$BIN" ]]; then
+    echo "WARNING: $BIN not built yet — run 'cargo build --release' before starting the daemon." >&2
+fi
+mkdir -p "$UNIT_DIR"
+sed "s|@BIN@|$BIN|" "$SRC/../systemd/wayland-agent.service.in" > "$UNIT_DIR/wayland-agent.service"
+# Clear any login autostart left by an older install.sh.
+rm -f "$UNIT_DIR/graphical-session.target.wants/wayland-agent.service"
+systemctl --user daemon-reload
+echo "Installed $UNIT_DIR/wayland-agent.service (off until toggled on in Quick Settings)"
 
 if command -v gnome-extensions >/dev/null 2>&1; then
     if gnome-extensions enable "$UUID" 2>/dev/null; then

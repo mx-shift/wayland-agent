@@ -1,0 +1,21 @@
+# systemd user unit for the wayland-agent daemon. Installed (with @BIN@
+# filled in) by gnome-extension/install.sh; the gnome-shell extension's
+# Quick Settings toggle starts and stops it.
+#
+# Type=notify: the daemon reports READY only after the portal consent
+# dialog is accepted, so the unit sits in "activating" while the prompt
+# is up. No Restart=: the daemon exits when the user stops the screen
+# capture or declines consent, and restarting would just re-prompt.
+#
+# No [Install] section: the daemon is off by default and only runs
+# while switched on from the Quick Settings toggle.
+
+[Unit]
+Description=wayland-agent input/screenshot daemon
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=notify
+ExecStart=@BIN@ daemon
+TimeoutStartSec=infinity

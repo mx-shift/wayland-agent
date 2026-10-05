@@ -60,6 +60,29 @@ pub fn socket_path() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".cache/wayland-agent.sock"))
 }
 
+/// Tell systemd about our state when run as a `Type=notify` unit
+/// (`READY=1`, `STATUS=...`). A no-op outside systemd. Readiness is
+/// only signalled once the portal session is up and the socket is
+/// listening, so the unit stays "activating" while the consent dialog
+/// is pending — which is what the gnome-shell toggle shows as
+/// "waiting for consent".
+fn sd_notify(msg: &str) {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixDatagram};
+    let Some(path) = std::env::var_os("NOTIFY_SOCKET") else { return };
+    let path = path.to_string_lossy().into_owned();
+    let addr = match path.strip_prefix('@') {
+        Some(name) => SocketAddr::from_abstract_name(name.as_bytes()),
+        None => SocketAddr::from_pathname(&path),
+    };
+    let sent = addr.and_then(|addr| {
+        UnixDatagram::unbound()?.send_to_addr(msg.as_bytes(), &addr)
+    });
+    if let Err(e) = sent {
+        eprintln!("wayland-agent: sd_notify({msg:?}) failed: {e}");
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd")]
 pub enum Request {
@@ -686,6 +709,7 @@ pub async fn run_daemon() -> Result<()> {
     }
 
     eprintln!("wayland-agent: establishing portal session (consent prompt may appear)...");
+    sd_notify("STATUS=Waiting for screen-sharing consent");
     let (rd, sc, session, fd, streams) = establish_and_prime().await?;
     eprintln!("wayland-agent: session ready, {} stream(s)", streams.len());
 
@@ -708,15 +732,49 @@ pub async fn run_daemon() -> Result<()> {
     let perms = std::fs::Permissions::from_mode(0o600);
     std::fs::set_permissions(&sock, perms).context("chmod socket")?;
     eprintln!("wayland-agent: listening on {}", sock.display());
+    sd_notify("READY=1\nSTATUS=Running");
+
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
+    let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
 
     loop {
-        let (stream, _addr) = listener.accept().await.context("accept")?;
-        let state = state.clone();
-        tokio::task::spawn(async move {
-            if let Err(e) = handle_client(stream, state).await {
-                eprintln!("wayland-agent: client error: {e:#}");
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _addr) = accepted.context("accept")?;
+                let state = state.clone();
+                tokio::task::spawn(async move {
+                    if let Err(e) = handle_client(stream, state).await {
+                        eprintln!("wayland-agent: client error: {e:#}");
+                    }
+                });
             }
-        });
+            _ = sigterm.recv() => break,
+            _ = sigint.recv() => break,
+        }
+    }
+
+    shutdown(&state, &sock).await;
+    Ok(())
+}
+
+/// Close the portal session explicitly before exiting. Dying without
+/// doing so (the default on SIGTERM, i.e. `systemctl stop` / the Quick
+/// Settings toggle) leaves gnome-shell's screen-sharing indicator up
+/// until something makes it re-check — it doesn't react to the
+/// session's owner vanishing from the bus.
+async fn shutdown(state: &Arc<Mutex<DaemonState>>, sock: &PathBuf) {
+    eprintln!("wayland-agent: shutting down; closing portal session");
+    sd_notify("STOPPING=1");
+    let _ = std::fs::remove_file(sock);
+    let session = {
+        let mut st = state.lock().await;
+        // Retire the Closed watcher so it doesn't race us to exit().
+        st.generation += 1;
+        st.session.clone()
+    };
+    if let Err(e) = session.close().await {
+        eprintln!("wayland-agent: closing portal session failed: {e:#}");
     }
 }
 
